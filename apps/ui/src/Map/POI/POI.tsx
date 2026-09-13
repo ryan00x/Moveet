@@ -1,32 +1,42 @@
-import { Craft, Leisure, Office, Shop, Bus, Unknown } from "@/components/Icons";
+import {
+  Bus,
+  Church,
+  Fuel,
+  GraduationCap,
+  HeartPulse,
+  Landmark,
+  ShoppingBag,
+  Ticket,
+  Utensils,
+} from "lucide-react";
 import type { POI, Position } from "@/types";
-import React, { memo } from "react";
+import { memo } from "react";
 import HTMLMarker from "@/components/Map/components/HTMLMarker";
-import { cn } from "@/lib/utils";
-import { getFillByType, isBusStop } from "./helpers";
+import { groupForType, markerSizeForGroup, type PoiGroup } from "./categories";
+import { getFillForGroup } from "./helpers";
 
-const IconByType = memo(function IconByType({
-  type,
-  className,
-}: {
-  type: string;
-  className: string;
-}) {
-  let icon = <Unknown />;
-  if (type === "shop") {
-    icon = <Shop />;
-  } else if (type === "leisure") {
-    icon = <Leisure />;
-  } else if (type === "craft") {
-    icon = <Craft />;
-  } else if (type === "office") {
-    icon = <Office />;
-  } else if (type === "bus_stop") {
-    icon = <Bus />;
-  }
+/** Same nine glyphs the icon atlas draws, so the HTML marker matches the GPU one. */
+const GROUP_ICONS: Record<PoiGroup, typeof Bus> = {
+  transit: Bus,
+  shop: ShoppingBag,
+  food: Utensils,
+  health: HeartPulse,
+  education: GraduationCap,
+  civic: Landmark,
+  worship: Church,
+  leisure: Ticket,
+  fuel: Fuel,
+};
 
-  return React.cloneElement(icon, { className });
-});
+/**
+ * A POI with no group is noise the map never draws — but it can still be the
+ * search/inspector selection, so it borrows the neutral civic styling rather
+ * than rendering as a blank chip.
+ */
+const FALLBACK_GROUP: PoiGroup = "civic";
+
+/** Glyph size as a fraction of the disc, matching the icon atlas's proportions. */
+const GLYPH_RATIO = 0.64;
 
 interface POIMarkerProps {
   poi: POI;
@@ -36,7 +46,14 @@ interface POIMarkerProps {
 
 const POIMarker = memo(function POIMarker({ poi, showLabel, onClick }: POIMarkerProps) {
   const position = [poi.coordinates[1], poi.coordinates[0]] as Position;
-  const bus = isBusStop(poi);
+  const group = groupForType(poi.type) ?? FALLBACK_GROUP;
+  const Icon = GROUP_ICONS[group];
+  // The same anchor/carpet sizing the GPU markers use, so the selected POI does
+  // not change size when it crosses from `POIs`' IconLayer to this marker.
+  // Sized inline rather than in classes: the sizes are data, and Tailwind can
+  // only emit the utilities it can see spelled out.
+  const size = markerSizeForGroup(group);
+  const glyph = Math.round(size * GLYPH_RATIO);
   return (
     <HTMLMarker key={poi.id} position={position} onClick={onClick}>
       {showLabel && (
@@ -45,18 +62,16 @@ const POIMarker = memo(function POIMarker({ poi, showLabel, onClick }: POIMarker
         </div>
       )}
       <div
-        className={cn(
-          "flex animate-in fade-in cursor-pointer items-center justify-center transition-transform duration-200 ease-out",
-          bus
-            ? "-ml-[7px] -mt-[7px] h-3.5 w-3.5 rounded-[5px] border border-[#333d] hover:scale-150"
-            : "-ml-[11px] -mt-[11px] h-[22px] w-[22px] rounded-full border border-[#ffffff66] hover:scale-[2]"
-        )}
-        style={{ background: getFillByType(poi.type) }}
+        className="flex animate-in fade-in cursor-pointer items-center justify-center rounded-full border border-[#ffffff66] transition-transform duration-200 ease-out hover:scale-150"
+        style={{
+          background: getFillForGroup(group),
+          width: size,
+          height: size,
+          marginLeft: -size / 2,
+          marginTop: -size / 2,
+        }}
       >
-        <IconByType
-          type={poi.type}
-          className={cn(bus ? "h-5 w-5 fill-[#333d]" : "h-4 w-4 fill-[#fffd]")}
-        />
+        <Icon className="text-[#fffd]" style={{ width: glyph, height: glyph }} />
       </div>
     </HTMLMarker>
   );

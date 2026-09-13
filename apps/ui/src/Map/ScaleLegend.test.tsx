@@ -55,6 +55,11 @@ describe("ScaleLegend", () => {
     expect(screen.getByTestId("scale-legend-max")).toHaveTextContent("250");
   });
 
+  it("drops the ramp note once it has a real table to read instead", () => {
+    render(<ScaleLegend title="Vehicles per bin" colorRange={RAMP} domain={[0, 60]} />);
+    expect(screen.queryByTestId("scale-legend-ramp-note")).toBeNull();
+  });
+
   it("exposes every bin boundary in the screen-reader table", () => {
     render(<ScaleLegend title="Vehicles per bin" colorRange={RAMP} domain={[0, 60]} />);
     const rows = screen.getByTestId("scale-legend-table").querySelectorAll("li");
@@ -63,11 +68,18 @@ describe("ScaleLegend", () => {
     expect(rows[5].textContent).toBe("Step 6 of 6: 50 to 60");
   });
 
-  it("shows placeholders, not invented numbers, before a domain is known", () => {
-    render(<ScaleLegend title="Vehicles per bin" colorRange={RAMP} domain={null} />);
-    expect(screen.getByTestId("scale-legend-min")).toHaveTextContent("—");
-    expect(screen.getByTestId("scale-legend-max")).toHaveTextContent("—");
+  it("omits the number row entirely when there is no domain", () => {
+    render(<ScaleLegend title="Vehicle heat" colorRange={RAMP} domain={null} />);
+    // Not dashes: an overlay with no countable domain would be promising a
+    // number that never arrives.
+    expect(screen.queryByTestId("scale-legend-min")).toBeNull();
+    expect(screen.queryByTestId("scale-legend-max")).toBeNull();
     expect(screen.queryByTestId("scale-legend-table")).toBeNull();
+    expect(screen.getByTestId("scale-legend")).not.toHaveTextContent("—");
+    // Still not silent: the figure says what the bar is.
+    expect(screen.getByTestId("scale-legend-ramp-note")).toHaveTextContent(
+      "Colour ramp, low to high"
+    );
     // The ramp itself is still shown — it is what is on screen.
     expect(screen.getAllByTestId("scale-legend-step")).toHaveLength(RAMP.length);
   });
@@ -90,6 +102,8 @@ describe("ScaleLegend", () => {
     expect(root).toHaveAttribute("role", "figure");
     expect(root).toHaveAttribute("aria-label", "Vehicles per bin");
     expect(root.className).toContain("pointer-events-none");
+    // Placement belongs to LegendStack now, not to the legend itself.
+    expect(root.className).not.toContain("absolute");
   });
 
   it("formats values with the caller's formatter", () => {

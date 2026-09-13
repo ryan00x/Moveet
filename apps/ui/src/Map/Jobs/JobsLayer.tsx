@@ -1,9 +1,18 @@
-import { memo, useMemo } from "react";
+import { useMemo } from "react";
 import { PathLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
 import type { Layer } from "@deck.gl/core";
 import type { JobDTO, Position } from "@/types";
 import { resolveMapColor } from "@/lib/mapColor";
+import {
+  LABEL_PRIORITY,
+  LABEL_TOKEN,
+  mapLabelProps,
+  useVisibleLabels,
+  type LabelItem,
+} from "@/lib/mapLabels";
+import { useMapContext } from "@/components/Map/hooks";
 import { useRegisterLayers } from "@/components/Map/hooks/useDeckLayers";
+import { useSettledZoom } from "../hooks/useSettledZoom";
 
 export const JOBS_LAYER_ID = "jobs";
 
@@ -31,7 +40,12 @@ export const JOB_COLOR_TOKENS = {
 /** Key of the draft marker in the pickup layer's data. */
 const DRAFT_KEY = "draft";
 
-const WHITE: RGBA = [255, 255, 255, 255];
+/** Label size and offset, shared between the TextLayer and the declutter pass. */
+const LABEL_SIZE = 11;
+const LABEL_OFFSET: [number, number] = [0, -11];
+
+/** A job past its SLA outranks the rest of the queue for label space. */
+const LATE_LABEL_BOOST = 5;
 
 /**
  * Which token a stop paints with. Split out from the accessors (and exported)
@@ -69,6 +83,7 @@ interface LinkDatum {
 }
 
 interface LabelDatum {
+  key: string;
   position: [number, number];
   text: string;
   late: boolean;
@@ -95,13 +110,45 @@ interface JobsLayerProps {
  * Mounted from `Map.tsx` behind the `showJobs` visibility toggle. Purely
  * derived from the job board — no picking, no interaction: the panel owns job
  * actions, this layer only makes the geography of the queue legible.
+ *
+ * Deliberately not wrapped in `memo()`: it subscribes to the map context, which
+ * publishes a new viewport on every pan frame, so the wrapper only ever added a
+ * props comparison that could not prevent a render. The memos below are what
+ * actually keep the layers stable.
  */
-export default memo(function JobsLayer({ jobs, draftPickup }: JobsLayerProps) {
-  const layers = useMemo(() => {
+export default function JobsLayer({ jobs, draftPickup }: JobsLayerProps) {
+  const { viewport, getZoom } = useMapContext();
+  const { settledZoom } = useSettledZoom(getZoom());
+
+  // Job references are decluttered against every other map label, so a dense
+  // queue can't bury the selected route's readout (or its own neighbours).
+  const labelItems = useMemo<LabelItem[]>(
+    () =>
+      jobs.map((job) => ({
+        id: job.id,
+        position: toDeck(job.pickup.position),
+        text: job.reference,
+        size: LABEL_SIZE,
+        priority: LABEL_PRIORITY.job + (job.slaBreached ? LATE_LABEL_BOOST : 0),
+        pixelOffset: LABEL_OFFSET,
+      })),
+    [jobs]
+  );
+
+  const visibleLabels = useVisibleLabels(
+    `${JOBS_LAYER_ID}-labels`,
+    labelItems,
+    viewport,
+    settledZoom
+  );
+
+  // Geometry and labels live in separate memos: a label verdict changes
+  // whenever anything anywhere on the map moves, and rebuilding the stop
+  // markers and link lines for that would re-upload the whole queue for nothing.
+  const geometryLayers = useMemo(() => {
     const pickups: StopDatum[] = [];
     const dropoffs: StopDatum[] = [];
     const links: LinkDatum[] = [];
-    const labels: LabelDatum[] = [];
 
     for (const job of jobs) {
       const from = toDeck(job.pickup.position);
@@ -110,7 +157,6 @@ export default memo(function JobsLayer({ jobs, draftPickup }: JobsLayerProps) {
       pickups.push({ key: `${job.id}-p`, position: from, late });
       dropoffs.push({ key: `${job.id}-d`, position: to, late });
       links.push({ path: [from, to], late });
-      labels.push({ position: from, text: job.reference, late });
     }
 
     if (draftPickup) {
@@ -146,7 +192,7 @@ export default memo(function JobsLayer({ jobs, draftPickup }: JobsLayerProps) {
         getRadius: 6,
         radiusUnits: "pixels",
         getFillColor: (d) => withAlpha(tokenForStop(d, "pickup"), 255),
-        getLineColor: WHITE,
+        getLineColor: withAlpha(LABEL_TOKEN, 255),
         getLineWidth: 1.5,
         lineWidthUnits: "pixels",
         stroked: true,
@@ -177,29 +223,44 @@ export default memo(function JobsLayer({ jobs, draftPickup }: JobsLayerProps) {
       );
     }
 
-    if (labels.length > 0) {
-      result.push(
-        new TextLayer<LabelDatum>({
-          id: `${JOBS_LAYER_ID}-labels`,
-          data: labels,
-          getPosition: (d) => d.position,
-          getText: (d) => d.text,
-          getColor: (d) => withAlpha(d.late ? JOB_COLOR_TOKENS.late : JOB_COLOR_TOKENS.pickup, 255),
-          getSize: 11,
-          getTextAnchor: "middle",
-          getAlignmentBaseline: "bottom",
-          getPixelOffset: [0, -11],
-          fontWeight: "600",
-          pickable: false,
-          updateTriggers: { getColor: labels.map((l) => l.late) },
-        })
-      );
-    }
-
     return result;
   }, [jobs, draftPickup]);
+
+  const labelLayers = useMemo(() => {
+    const labels: LabelDatum[] = [];
+    for (const job of jobs) {
+      if (!visibleLabels.has(job.id)) continue;
+      labels.push({
+        key: job.id,
+        position: toDeck(job.pickup.position),
+        text: job.reference,
+        late: job.slaBreached,
+      });
+    }
+    if (labels.length === 0) return NO_LAYERS;
+    return [
+      new TextLayer<LabelDatum>({
+        ...mapLabelProps(LABEL_SIZE),
+        id: `${JOBS_LAYER_ID}-labels`,
+        data: labels,
+        getPosition: (d) => d.position,
+        getText: (d) => d.text,
+        getColor: (d) => withAlpha(d.late ? JOB_COLOR_TOKENS.late : JOB_COLOR_TOKENS.pickup, 255),
+        getTextAnchor: "middle",
+        getAlignmentBaseline: "bottom",
+        getPixelOffset: LABEL_OFFSET,
+        pickable: false,
+        updateTriggers: { getColor: labels.map((l) => l.late) },
+      }),
+    ];
+  }, [jobs, visibleLabels]);
+
+  const layers = useMemo(
+    () => (labelLayers.length === 0 ? geometryLayers : [...geometryLayers, ...labelLayers]),
+    [geometryLayers, labelLayers]
+  );
 
   useRegisterLayers(JOBS_LAYER_ID, layers);
 
   return null;
-});
+}

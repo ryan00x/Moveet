@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useMemo } from "react";
+import { lazy, Suspense, useCallback, useMemo, useRef, useState } from "react";
 import type { PickingInfo } from "@deck.gl/core";
 import type {
   DispatchAssignment,
@@ -15,8 +15,10 @@ import type {
 } from "@/types";
 import type { BoundingBox, GeoFence } from "@moveet/shared-types";
 import type { Filters } from "@/hooks/useVehicles";
-import { DispatchState, cursorForDispatchState } from "@/hooks/useDispatchState";
+import { DispatchState } from "@/hooks/useDispatchState";
+import type { InteractionModeKind } from "@/hooks/useInteractionMode";
 import type { WaypointRef } from "@/hooks/useDispatchFlow";
+import { cursorForMode } from "./modeCursor";
 
 // Lazily load the WebGL canvas so the app shell + control panels can paint
 // before the deck.gl/luma.gl stack (its own `deckgl` vendor chunk) is fetched
@@ -37,6 +39,7 @@ import POIMarker from "./POI/POI";
 import GeofenceLayer from "./Geofence/GeofenceLayer";
 import GeofenceDrawTool from "./Geofence/GeofenceDrawTool";
 import { ViewportBboxReporter } from "./ViewportBboxReporter";
+import LegendStack from "./LegendStack";
 
 // Stable fallback for optional callbacks — inline `() => {}` literals would
 // hand child layers a new prop identity on every render.
@@ -65,6 +68,8 @@ const JobsLayer = lazy(() => import("./Jobs/JobsLayer"));
 
 interface MapProps {
   network: RoadNetwork;
+  /** The active interaction mode — the single source of the map cursor. */
+  modeKind: InteractionModeKind;
   filters: Filters;
   vehicles: Vehicle[];
   modifiers: Modifiers;
@@ -105,12 +110,11 @@ interface MapProps {
   onBboxChange?: (bbox: BoundingBox | null) => void;
   /** Lock map panning (heat-zone tool engaged) so press-drags draw/edit zones. */
   panLocked?: boolean;
-  /** Heat-zone draw mode is active - show a crosshair cursor. */
-  zoneDrawActive?: boolean;
 }
 
 export default function Map({
   network,
+  modeKind,
   vehicles,
   modifiers,
   filters,
@@ -142,16 +146,24 @@ export default function Map({
   drawUndoId,
   onBboxChange,
   panLocked = false,
-  zoneDrawActive = false,
 }: MapProps) {
-  // Derive cursor: the two modal point-picking modes win (crosshair), then
-  // dispatchState, else grab.
-  const cursor =
-    zoneDrawActive || jobPlacementActive
-      ? "crosshair"
-      : dispatchState
-        ? cursorForDispatchState(dispatchState)
-        : "grab";
+  // One cursor table, keyed by the interaction mode (see modeCursor.ts).
+  const cursor = cursorForMode(modeKind, dispatchState);
+
+  /**
+   * The legend column. Overlays have to stay inside `DeckGLMap` (that is where
+   * they register their layers), so they portal their legends into this one
+   * element instead — see `LegendStack`. The element only exists after the
+   * first commit, hence the state flag: it re-renders the tree once, and the
+   * overlays then find a live slot (they render inline until they do).
+   */
+  const legendSlotRef = useRef<HTMLDivElement | null>(null);
+  const [legendSlotReady, setLegendSlotReady] = useState(false);
+  const attachLegendSlot = useCallback((el: HTMLDivElement | null) => {
+    legendSlotRef.current = el;
+    setLegendSlotReady(el !== null);
+  }, []);
+  const legendSlot = legendSlotReady ? legendSlotRef : undefined;
 
   // Native deck.gl tooltip for GL-picked layers (currently just vehicles —
   // POIs/incidents render their own styled HTML markers instead). Hover is
@@ -192,131 +204,133 @@ export default function Map({
   );
 
   return (
-    <Suspense fallback={null}>
-      <DeckGLMap
-        data={network}
-        strokeOpacity={modifiers.showDirections ? 0.4 : 0}
-        strokeColor="#5b6575"
-        strokeWidth={1.5}
-        onClick={onMapClick}
-        onContextClick={onMapContextClick}
-        cursor={cursor}
-        panLocked={panLocked}
-        htmlMarkers={htmlMarkers}
-        getTooltip={getTooltip}
-      >
-        {/* POIs & speed-limit signs — GPU-rendered via IconLayer */}
-        {modifiers.showPOIs && (
-          <Suspense fallback={null}>
-            <POIs
-              visible={modifiers.showPOIs}
-              onClick={onPOIClick}
-              selectable={!jobPlacementActive}
-            />
-          </Suspense>
-        )}
-        {modifiers.showSpeedLimits && (
-          <Suspense fallback={null}>
-            <SpeedLimitSigns visible={modifiers.showSpeedLimits} />
-          </Suspense>
-        )}
-        {/* Geofence zones — rendered between roads and vehicles. Fence clicks
+    <>
+      <LegendStack ref={attachLegendSlot} />
+      <Suspense fallback={null}>
+        <DeckGLMap
+          data={network}
+          strokeOpacity={modifiers.showDirections ? 0.4 : 0}
+          strokeColor="#5b6575"
+          strokeWidth={1.5}
+          onClick={onMapClick}
+          onContextClick={onMapContextClick}
+          cursor={cursor}
+          panLocked={panLocked}
+          htmlMarkers={htmlMarkers}
+          getTooltip={getTooltip}
+        >
+          {/* POIs & speed-limit signs — GPU-rendered via IconLayer */}
+          {modifiers.showPOIs && (
+            <Suspense fallback={null}>
+              <POIs
+                visible={modifiers.showPOIs}
+                onClick={onPOIClick}
+                selectable={!jobPlacementActive}
+              />
+            </Suspense>
+          )}
+          {modifiers.showSpeedLimits && (
+            <Suspense fallback={null}>
+              <SpeedLimitSigns visible={modifiers.showSpeedLimits} />
+            </Suspense>
+          )}
+          {/* Geofence zones — rendered between roads and vehicles. Fence clicks
             select/deselect only in browse mode (`fencesSelectable`, derived
             from the interaction mode) plus outside job placement, so a modal
             click always reaches the mode that asked for it. */}
-        {fences.length > 0 && (
-          <GeofenceLayer
-            fences={fences}
-            selectedFenceId={selectedFenceId}
-            onSelectFence={onSelectFence}
-            selectable={fencesSelectable && !jobPlacementActive}
-          />
-        )}
-        <Direction selected={filters.selected} hovered={filters.hovered} />
-        {modifiers.showBreadcrumbs && (
-          <Suspense fallback={null}>
-            <BreadcrumbLayer
-              selectedId={filters.selected}
-              showAll={true}
-              vehicleFleetMap={vehicleFleetMap}
-              hiddenFleetIds={hiddenFleetIds}
+          {fences.length > 0 && (
+            <GeofenceLayer
+              fences={fences}
+              selectedFenceId={selectedFenceId}
+              onSelectFence={onSelectFence}
+              selectable={fencesSelectable && !jobPlacementActive}
             />
-          </Suspense>
-        )}
-        {modifiers.showHeatzones && (
-          <Suspense fallback={null}>
-            <TrafficZones visible={modifiers.showHeatzones} />
-          </Suspense>
-        )}
-        {modifiers.showTrafficOverlay && (
-          <Suspense fallback={null}>
-            <TrafficOverlay
-              visible={true}
-              // Stack under the density legend, which owns the top-left slot.
-              legendClassName={modifiers.showDensity ? "left-3 top-[160px]" : "left-3 top-[72px]"}
-            />
-          </Suspense>
-        )}
-
-        {modifiers.showVehicles && (
-          <VehiclesLayer
-            scale={1.5}
-            vehicleFleetMap={vehicleFleetMap}
-            hiddenFleetIds={hiddenFleetIds}
-            hiddenVehicleTypes={hiddenVehicleTypes}
-            selectedId={filters.selected}
-            hoveredId={filters.hovered}
-            onClick={onClick}
-            onHover={onHoverVehicle}
-            densityMode={modifiers.showDensity}
-            // A pickup/dropoff click that lands on a sprite must place the point,
-            // not select the vehicle and silently swallow the click.
-            selectable={!jobPlacementActive}
-          />
-        )}
-        {modifiers.showDensity && (
-          <Suspense fallback={null}>
-            <VehicleDensityLayer
+          )}
+          {/* The three legend-producing overlays, in the order their legends
+            stack in `LegendStack` (portal insertion follows tree order). Their
+            draw order is unaffected — that comes from LAYER_ORDER. */}
+          {modifiers.showDensity && (
+            <Suspense fallback={null}>
+              <VehicleDensityLayer
+                vehicleFleetMap={vehicleFleetMap}
+                hiddenFleetIds={hiddenFleetIds}
+                hiddenVehicleTypes={hiddenVehicleTypes}
+                legendSlot={legendSlot}
+              />
+            </Suspense>
+          )}
+          {modifiers.showTrafficOverlay && (
+            <Suspense fallback={null}>
+              <TrafficOverlay visible={true} legendSlot={legendSlot} />
+            </Suspense>
+          )}
+          {modifiers.showHeatmap && (
+            <Suspense fallback={null}>
+              <Heatmap vehicles={vehicles} legendSlot={legendSlot} />
+            </Suspense>
+          )}
+          <Direction selected={filters.selected} hovered={filters.hovered} />
+          {modifiers.showBreadcrumbs && (
+            <Suspense fallback={null}>
+              <BreadcrumbLayer
+                selectedId={filters.selected}
+                showAll={true}
+                vehicleFleetMap={vehicleFleetMap}
+                hiddenFleetIds={hiddenFleetIds}
+              />
+            </Suspense>
+          )}
+          {modifiers.showHeatzones && (
+            <Suspense fallback={null}>
+              <TrafficZones visible={modifiers.showHeatzones} />
+            </Suspense>
+          )}
+          {modifiers.showVehicles && (
+            <VehiclesLayer
+              scale={1.5}
               vehicleFleetMap={vehicleFleetMap}
               hiddenFleetIds={hiddenFleetIds}
               hiddenVehicleTypes={hiddenVehicleTypes}
+              selectedId={filters.selected}
+              hoveredId={filters.hovered}
+              onClick={onClick}
+              onHover={onHoverVehicle}
+              densityMode={modifiers.showDensity}
+              // A pickup/dropoff click that lands on a sprite must place the point,
+              // not select the vehicle and silently swallow the click.
+              selectable={!jobPlacementActive}
             />
-          </Suspense>
-        )}
-        {/* Mounted while placing too, so the first click's pickup marker shows
+          )}
+          {/* Mounted while placing too, so the first click's pickup marker shows
             even with the Jobs overlay toggled off. */}
-        {(modifiers.showJobs || jobPlacementActive) && (
-          <Suspense fallback={null}>
-            <JobsLayer
-              jobs={modifiers.showJobs ? jobs : []}
-              draftPickup={jobPlacementActive ? jobDraftPickup : null}
+          {(modifiers.showJobs || jobPlacementActive) && (
+            <Suspense fallback={null}>
+              <JobsLayer
+                jobs={modifiers.showJobs ? jobs : []}
+                draftPickup={jobPlacementActive ? jobDraftPickup : null}
+              />
+            </Suspense>
+          )}
+          {selectedItem && isRoad(selectedItem) && <RoadRenderer road={selectedItem} />}
+          {assignments.length > 0 && (
+            <PendingDispatch
+              assignments={assignments}
+              vehicles={vehicles}
+              editable={dispatchState === DispatchState.ROUTE}
+              onMoveWaypointGroup={onMoveWaypointGroup ?? NOOP}
+              onRemoveWaypointGroup={onRemoveWaypointGroup ?? NOOP}
             />
-          </Suspense>
-        )}
-        {modifiers.showHeatmap && (
-          <Suspense fallback={null}>
-            <Heatmap vehicles={vehicles} />
-          </Suspense>
-        )}
-        {selectedItem && isRoad(selectedItem) && <RoadRenderer road={selectedItem} />}
-        {assignments.length > 0 && (
-          <PendingDispatch
-            assignments={assignments}
-            vehicles={vehicles}
-            editable={dispatchState === DispatchState.ROUTE}
-            onMoveWaypointGroup={onMoveWaypointGroup ?? NOOP}
-            onRemoveWaypointGroup={onRemoveWaypointGroup ?? NOOP}
+          )}
+          <GeofenceDrawTool
+            active={drawingActive}
+            onComplete={onDrawComplete ?? NOOP}
+            onVertexCountChange={onDrawVertexCountChange}
+            confirmRequestId={drawConfirmId}
+            undoRequestId={drawUndoId}
           />
-        )}
-        <GeofenceDrawTool
-          active={drawingActive}
-          onComplete={onDrawComplete ?? NOOP}
-          onVertexCountChange={onDrawVertexCountChange}
-          confirmRequestId={drawConfirmId}
-          undoRequestId={drawUndoId}
-        />
-        {onBboxChange && <ViewportBboxReporter onBboxChange={onBboxChange} />}
-      </DeckGLMap>
-    </Suspense>
+          {onBboxChange && <ViewportBboxReporter onBboxChange={onBboxChange} />}
+        </DeckGLMap>
+      </Suspense>
+    </>
   );
 }

@@ -5,8 +5,10 @@ import { useTraffic } from "@/hooks/useTraffic";
 import { useRegisterLayers } from "@/components/Map/hooks/useDeckLayers";
 import { TrafficIcon } from "@/components/Icons";
 import { resolveMapColor } from "@/lib/mapColor";
+import { CASING_TOKEN } from "@/lib/mapLabels";
 import type { TrafficEdge } from "@/types";
 import ScaleLegend, { type LegendColor } from "./ScaleLegend";
+import { renderInSlot, type LegendSlot } from "./LegendStack";
 
 type RGBA = [number, number, number, number];
 
@@ -35,8 +37,9 @@ const DEFAULT_WIDTH_M = 5;
 const MIN_WIDTH_PX = 3;
 const MAX_WIDTH_PX = 12;
 
-/** Dark outline drawn under the colour line so it reads over grey roads. */
-const CASING_RGBA: RGBA = [8, 10, 14, 230];
+/** Dark outline drawn under the colour line so it reads over grey roads —
+ *  CASING_TOKEN is the shared map-label casing. */
+const CASING_ALPHA = 230;
 const CASING_SCALE = 1.7;
 const CASING_MIN_PX = 6;
 const CASING_MAX_PX = 18;
@@ -47,13 +50,16 @@ const CASING_MAX_PX = 18;
  * 0.5 is at capacity. Between stops the colour is interpolated, so the overlay
  * reads as a continuous ramp instead of three hard buckets.
  */
-const CONGESTION_STOPS: ReadonlyArray<readonly [number, string]> = [
-  [0.2, "var(--color-traffic-jam)"],
-  [0.35, "var(--color-traffic-congested)"],
-  [0.5, "var(--color-traffic-heavy)"],
-  [0.7, "var(--color-traffic-slow)"],
-  [0.9, "var(--color-traffic-free)"],
+const CONGESTION_STOPS: ReadonlyArray<readonly [number, string, string]> = [
+  [0.2, "var(--color-traffic-jam)", "Jammed"],
+  [0.35, "var(--color-traffic-congested)", "Jammed"],
+  [0.5, "var(--color-traffic-heavy)", "Heavy"],
+  [0.7, "var(--color-traffic-slow)", "Slow"],
+  [0.9, "var(--color-traffic-free)", "Free flow"],
 ];
+
+/** Label of the band a value falls in, past the last stop included. */
+const TOP_BAND_LABEL = CONGESTION_STOPS[CONGESTION_STOPS.length - 1][2];
 
 /** Swatch count for the legend bar. The map itself is continuous. */
 const LEGEND_STEPS = 8;
@@ -172,22 +178,29 @@ export function buildTrafficSegments(edges: readonly TrafficEdge[]): TrafficSegm
   return Array.from(byKey.values()).sort((x, y) => y.congestion - x.congestion);
 }
 
+/**
+ * Congestion factor as the words a dispatcher uses.
+ *
+ * The bands are read off `CONGESTION_STOPS` rather than restated as literals:
+ * the words then name exactly the colours the map paints, and a retuned stop
+ * moves both at once instead of leaving the legend describing the old ramp.
+ */
 function formatCongestion(value: number): string {
-  return value <= CONGESTION_MIN ? "Jammed" : "Free flow";
+  for (const [breakpoint, , label] of CONGESTION_STOPS) {
+    if (value <= breakpoint) return label;
+  }
+  return TOP_BAND_LABEL;
 }
 
 const NO_LAYERS: Layer[] = [];
 
 interface TrafficOverlayProps {
   visible: boolean;
-  /** Legend positioning, so Map can keep it clear of other legends. */
-  legendClassName?: string;
+  /** Where the legend is portalled; inline when absent (tests, no stack yet). */
+  legendSlot?: LegendSlot;
 }
 
-export default function TrafficOverlay({
-  visible,
-  legendClassName = "left-3 top-[72px]",
-}: TrafficOverlayProps) {
+export default function TrafficOverlay({ visible, legendSlot }: TrafficOverlayProps) {
   const { edges } = useTraffic();
 
   const segments = useMemo(() => buildTrafficSegments(edges), [edges]);
@@ -218,7 +231,7 @@ export default function TrafficOverlay({
       new PathLayer<TrafficSegment>({
         ...shared,
         id: "traffic-overlay-casing",
-        getColor: CASING_RGBA,
+        getColor: resolveMapColor(CASING_TOKEN, CASING_ALPHA),
         getWidth: (d) => d.widthMeters * CASING_SCALE,
         widthMinPixels: CASING_MIN_PX,
         widthMaxPixels: CASING_MAX_PX,
@@ -238,7 +251,9 @@ export default function TrafficOverlay({
 
   if (!visible) return null;
 
-  return (
+  return renderInSlot(
+    legendSlot,
+    "traffic",
     <ScaleLegend
       testId="traffic-legend"
       title="Traffic"
@@ -247,7 +262,6 @@ export default function TrafficOverlay({
       colorRange={legendColors}
       domain={LEGEND_DOMAIN}
       formatValue={formatCongestion}
-      className={legendClassName}
     />
   );
 }

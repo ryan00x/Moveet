@@ -1,8 +1,20 @@
 import { useMemo, useEffect } from "react";
 import { PathLayer, TextLayer } from "@deck.gl/layers";
 import type { Position, Road } from "@/types";
-import { useMapControls } from "@/components/Map/hooks";
+import { useMapContext, useMapControls } from "@/components/Map/hooks";
 import { useRegisterLayers } from "@/components/Map/hooks/useDeckLayers";
+import { useSettledZoom } from "./hooks/useSettledZoom";
+import { resolveMapColor } from "@/lib/mapColor";
+import {
+  LABEL_PRIORITY,
+  LABEL_TOKEN,
+  mapLabelProps,
+  useVisibleLabels,
+  type LabelItem,
+} from "@/lib/mapLabels";
+
+/** Label size, shared between the TextLayer and the declutter pass. */
+const LABEL_SIZE = 14;
 
 interface DirectionProps {
   road: Road;
@@ -34,10 +46,38 @@ function centroid(coords: Position[]): Position {
 
 export default function DirectionMap({ road }: DirectionProps) {
   const { setBounds } = useMapControls();
+  const { viewport, getZoom } = useMapContext();
+  const { settledZoom } = useSettledZoom(getZoom());
 
   useEffect(() => {
     setBounds(getBounds(road.streets.flat()));
   }, [road.streets, setBounds]);
+
+  const center = useMemo(
+    () => (road.streets.length === 0 ? null : centroid(road.streets.flat())),
+    [road]
+  );
+
+  // The road the operator explicitly selected outranks every other label on the
+  // map, so this registers at the top of the priority scale and the POI carpet
+  // yields to it rather than the other way round.
+  const labelItems = useMemo<LabelItem[]>(
+    () =>
+      center === null
+        ? []
+        : [
+            {
+              id: "selected-road",
+              position: [center[0], center[1]],
+              text: road.name,
+              size: LABEL_SIZE,
+              priority: LABEL_PRIORITY.selectedRoad,
+            },
+          ],
+    [center, road.name]
+  );
+
+  const visibleLabels = useVisibleLabels("selected-road-label", labelItems, viewport, settledZoom);
 
   const layers = useMemo(() => {
     if (road.streets.length === 0) return [];
@@ -47,15 +87,14 @@ export default function DirectionMap({ road }: DirectionProps) {
       path: street as [number, number][],
     }));
 
-    const allCoords = road.streets.flat();
-    const center = centroid(allCoords);
+    const showLabel = center !== null && visibleLabels.has("selected-road");
 
     return [
       new PathLayer<(typeof pathData)[number]>({
         id: "selected-road-paths",
         data: pathData,
         getPath: (d) => d.path,
-        getColor: [255, 255, 255, 255],
+        getColor: resolveMapColor(LABEL_TOKEN),
         getWidth: 2,
         widthUnits: "pixels",
         jointRounded: true,
@@ -66,27 +105,18 @@ export default function DirectionMap({ road }: DirectionProps) {
         pickable: false,
       }),
       new TextLayer({
+        ...mapLabelProps(LABEL_SIZE),
         id: "selected-road-label",
-        data: [{ text: road.name, position: center }],
+        data: showLabel && center ? [{ text: road.name, position: center }] : [],
         getPosition: (d) => d.position,
         getText: (d) => d.text,
-        getColor: [255, 255, 255, 255],
-        getSize: 14,
+        getColor: resolveMapColor(LABEL_TOKEN),
         getTextAnchor: "middle",
         getAlignmentBaseline: "center",
-        fontFamily: "inherit",
-        // SDF is required for deck.gl to draw an outline at all; see the fuller
-        // explanation on the geofence label layer. Halo is 0.75 * outlineWidth
-        // atlas px scaled by getSize / 64, so outlineWidth 8 → 6 atlas px →
-        // ~1.3px on screen at getSize 14. radius must be >= outlineWidth and
-        // buffer >= the halo's 6 atlas px, or the atlas clips it.
-        fontSettings: { sdf: true, radius: 16, buffer: 8 },
-        outlineWidth: 8,
-        outlineColor: [0, 0, 0, 180],
         pickable: false,
       }),
     ];
-  }, [road]);
+  }, [road, center, visibleLabels]);
 
   useRegisterLayers("selected-road", layers);
 

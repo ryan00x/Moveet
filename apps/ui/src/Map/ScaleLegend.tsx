@@ -71,8 +71,6 @@ export interface ScaleLegendProps {
   domain: readonly [number, number] | null;
   formatValue?: (value: number) => string;
   icon?: LucideIcon;
-  /** Positioning — the component only fixes `absolute` and its z-index. */
-  className?: string;
   /** Distinguishes multiple legends in the DOM once overlays start sharing this. */
   testId?: string;
 }
@@ -84,7 +82,6 @@ export default function ScaleLegend({
   domain,
   formatValue = defaultFormat,
   icon: Icon,
-  className,
   testId = "scale-legend",
 }: ScaleLegendProps) {
   const breaks = domain ? quantizeBreaks(domain, colorRange.length) : null;
@@ -96,10 +93,10 @@ export default function ScaleLegend({
       data-testid={testId}
       className={cn(
         // Non-interactive: a continuous scale has nothing to toggle, and the
-        // map must stay draggable under it.
-        "pointer-events-none absolute z-10 w-[164px] animate-fade-up",
-        "rounded-lg border border-border surface-glass glass-frost p-2.5 shadow-elevated",
-        className
+        // map must stay draggable under it. Placement belongs to the
+        // `LegendStack` this renders into, not here.
+        "pointer-events-none w-full animate-fade-up",
+        "rounded-lg border border-border surface-glass glass-frost p-2.5 shadow-elevated"
       )}
     >
       <div className="flex items-center gap-1.5">
@@ -130,12 +127,28 @@ export default function ScaleLegend({
         ))}
       </div>
 
-      <div className="mt-1 flex items-baseline justify-between text-[10px] tabular-nums text-muted-foreground">
-        <span data-testid={`${testId}-min`}>{breaks ? formatValue(breaks[0]) : "—"}</span>
-        <span data-testid={`${testId}-max`}>
-          {breaks ? formatValue(breaks[breaks.length - 1]) : "—"}
+      {/*
+        With no domain there is no table either, so the figure would otherwise
+        be announced as a title and nothing else. Say what the bar is instead.
+      */}
+      {!breaks && (
+        <span className="sr-only" data-testid={`${testId}-ramp-note`}>
+          Colour ramp, low to high
         </span>
-      </div>
+      )}
+
+      {/*
+        No domain, no numbers. A ramp with placeholder ends reads as "the
+        scale is loading"; some overlays (the heatmap's smoothed density
+        field) simply have no countable domain, and dashes there would be
+        furniture promising a number that is never coming.
+      */}
+      {breaks && (
+        <div className="mt-1 flex items-baseline justify-between text-[10px] tabular-nums text-muted-foreground">
+          <span data-testid={`${testId}-min`}>{formatValue(breaks[0])}</span>
+          <span data-testid={`${testId}-max`}>{formatValue(breaks[breaks.length - 1])}</span>
+        </div>
+      )}
 
       {/*
         The exact binning, for screen readers and as the "table view" every

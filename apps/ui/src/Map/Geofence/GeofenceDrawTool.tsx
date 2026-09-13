@@ -1,7 +1,10 @@
 import { useEffect, useRef, useCallback, useState, useMemo } from "react";
 import { PolygonLayer, ScatterplotLayer, PathLayer } from "@deck.gl/layers";
+import { PathStyleExtension, type PathStyleExtensionProps } from "@deck.gl/extensions";
 import { useMapContext, useOverlay } from "@/components/Map/hooks";
 import { useRegisterLayers } from "@/components/Map/hooks/useDeckLayers";
+import { resolveMapColor } from "@/lib/mapColor";
+import { LABEL_TOKEN } from "@/lib/mapLabels";
 
 /**
  * Keyboard (Escape to cancel, Enter to close the polygon) is handled by the
@@ -26,6 +29,15 @@ interface GeofenceDrawToolProps {
    */
   undoRequestId?: number;
 }
+
+/** The in-progress polygon's blue, and the green "close the ring here" target. */
+const DRAW_TOKEN = "var(--color-overlay-draw)";
+const CLOSE_TOKEN = "var(--color-overlay-draw-close)";
+
+/** The open chain and the cursor preview are dashed: they mark geometry that
+ *  is not committed yet, versus the solid outline of the closed polygon. */
+const dashStyle = new PathStyleExtension({ dash: true });
+const PREVIEW_DASH: [number, number] = [4, 3];
 
 // Hit-test radii (pixels) and drag threshold
 const VERTEX_HIT_PX = 10;
@@ -349,6 +361,16 @@ export default function GeofenceDrawTool({
   const layers = useMemo(() => {
     if (!active || vertices.length === 0) return [];
 
+    // Resolved here, not at module load: resolveMapColor caches its first
+    // answer, which at module-eval time predates the stylesheet.
+    const drawFill = resolveMapColor(DRAW_TOKEN, 48);
+    const drawLine = resolveMapColor(DRAW_TOKEN);
+    const drawSoft = resolveMapColor(DRAW_TOKEN, 179);
+    const drawHint = resolveMapColor(DRAW_TOKEN, 140);
+    const drawRing = resolveMapColor(DRAW_TOKEN, 180);
+    const closeLine = resolveMapColor(CLOSE_TOKEN);
+    const inkLine = resolveMapColor(LABEL_TOKEN);
+
     const result = [];
 
     // Filled polygon (≥ 3 vertices)
@@ -358,9 +380,9 @@ export default function GeofenceDrawTool({
           id: "geofence-draw-polygon",
           data: [{ polygon: vertices }],
           getPolygon: (d: { polygon: [number, number][] }) => d.polygon,
-          getFillColor: [59, 130, 246, 38],
-          getLineColor: [59, 130, 246, 255],
-          getLineWidth: 1.5,
+          getFillColor: drawFill,
+          getLineColor: drawLine,
+          getLineWidth: 2,
           lineWidthUnits: "pixels",
           filled: true,
           stroked: true,
@@ -386,13 +408,19 @@ export default function GeofenceDrawTool({
     }
     if (pathSegments.length > 0) {
       result.push(
-        new PathLayer({
+        new PathLayer<
+          { path: [number, number][] },
+          PathStyleExtensionProps<{ path: [number, number][] }>
+        >({
           id: "geofence-draw-lines",
           data: pathSegments,
-          getPath: (d: { path: [number, number][] }) => d.path,
-          getColor: [59, 130, 246, 179],
-          getWidth: 1,
+          getPath: (d) => d.path,
+          getColor: drawSoft,
+          getWidth: 1.5,
           widthUnits: "pixels",
+          getDashArray: PREVIEW_DASH,
+          dashJustified: true,
+          extensions: [dashStyle],
           pickable: false,
         })
       );
@@ -407,8 +435,8 @@ export default function GeofenceDrawTool({
           getPosition: (d: [number, number]) => d,
           getRadius: 4,
           radiusUnits: "pixels",
-          getFillColor: [59, 130, 246, 140],
-          getLineColor: [255, 255, 255, 255],
+          getFillColor: drawHint,
+          getLineColor: inkLine,
           getLineWidth: 1,
           lineWidthUnits: "pixels",
           stroked: true,
@@ -434,12 +462,14 @@ export default function GeofenceDrawTool({
         id: "geofence-draw-vertices",
         data: vertexData,
         getPosition: (d: { position: [number, number] }) => d.position,
-        getRadius: (d: { enlarged: boolean }) => (d.enlarged ? 6 : 4),
+        getRadius: (d: { enlarged: boolean }) => (d.enlarged ? 7 : 5),
         radiusUnits: "pixels",
-        getFillColor: (d: { closeTarget: boolean }) =>
-          d.closeTarget ? [34, 197, 94, 255] : [59, 130, 246, 255],
-        getLineColor: [255, 255, 255, 255],
-        getLineWidth: 1.5,
+        // White handles ringed in the draw blue read as grabbable dots against
+        // both the fill and the map; the first vertex swaps to the close green
+        // when clicking it would shut the ring.
+        getFillColor: (d: { closeTarget: boolean }) => (d.closeTarget ? closeLine : inkLine),
+        getLineColor: drawLine,
+        getLineWidth: 2,
         lineWidthUnits: "pixels",
         stroked: true,
         pickable: false,
@@ -460,7 +490,7 @@ export default function GeofenceDrawTool({
           getRadius: firstIsCloseTarget ? 10 : 8,
           radiusUnits: "pixels",
           getFillColor: [0, 0, 0, 0],
-          getLineColor: firstIsCloseTarget ? [34, 197, 94, 255] : [59, 130, 246, 180],
+          getLineColor: firstIsCloseTarget ? closeLine : drawRing,
           getLineWidth: firstIsCloseTarget ? 2 : 1,
           lineWidthUnits: "pixels",
           stroked: true,

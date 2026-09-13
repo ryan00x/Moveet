@@ -125,7 +125,11 @@ describe("GeofenceLayer", () => {
 
     expect(fontSettings?.sdf).toBe(true);
     expect(outlineWidth).toBeGreaterThan(0);
-    expect(outlineColor).toEqual([0, 0, 0, 204]);
+    // The halo colour comes from the shared map label style; jsdom has no
+    // canvas to resolve the token through, so mapColor's fallback grey stands
+    // in — but the alpha it was asked for survives, and that is the part this
+    // layer depends on.
+    expect(outlineColor).toEqual([128, 128, 128, 220]);
   });
 
   it("sizes the label halo so it stays inside the SDF atlas and is visible on screen", () => {

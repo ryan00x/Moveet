@@ -71,6 +71,20 @@
      zoom, legends — stands on this shelf instead of underneath them. */
   --spacing-above-dock: 5.5rem;
 
+  /* Height of the visibility rail, which stands on the dock shelf and grows
+     upward: 11 keys x 34px = 374, plus 10 x 2px gaps = 20, plus 8px of panel
+     padding = 402, plus ~31px when the trail-length and density chips are
+     showing, plus the rail's own 12px lift off the shelf. Rounded up to 448. */
+  --visibility-rail-band: 28rem;
+
+  /* Band at the bottom-left the legend stack must keep clear. The stack
+     (top-left, growing down) subtracts this from its max-height, so the two
+     columns run out of room before they can overlap — the collision that used
+     to put the traffic legend on top of the rail at a 1000px window. It is the
+     rail's height by definition; the indirection is so the stack reads as
+     "clearance" rather than reaching into the rail's own measurement. */
+  --legend-stack-clearance: var(--visibility-rail-band);
+
   /* Motion scale — registers the `duration-fast|normal|slow` Tailwind
      transition-duration utilities (Tailwind v4 reads the
      `--transition-duration-*` namespace). Keep transitions on this scale; the
@@ -225,6 +239,65 @@
     160px 160px,
     cover;
 }
+/* Modal-mode vignette. While a map tool owns the next click, the map itself
+   says so: a thin inset frame in the mode's tone plus a soft inward shadow that
+   pulls the eye off the chrome and onto the canvas. Purely decorative, so it is
+   a pointer-events-none ::after on the backdrop rather than another element in
+   the tree — it must never intercept a click meant for the tool.
+
+   The pseudo-element always exists and carries the transition, so entering and
+   leaving a mode both animate (a rule that only exists while in a mode has
+   nothing to fade from). `--mode-frame-color` carries the tone, and it is in
+   the transition too, so switching straight from one mode to another of a
+   different tone crossfades rather than cutting.
+
+   z-index 5 puts it over the (unlayered) deck canvas but under every HUD piece
+   (search bar, zoom, legends, dock — all z-10 and up), so the frame never
+   paints on top of a control. */
+/* Registered so the tone swap actually interpolates — an unregistered custom
+   property is a discrete value and would cut rather than crossfade. */
+@property --mode-frame-color {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: transparent;
+}
+
+.map-backdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  opacity: 0;
+  --mode-frame-color: var(--color-accent);
+  box-shadow:
+    inset 0 0 0 2px color-mix(in oklch, var(--mode-frame-color) 70%, transparent),
+    inset 0 0 96px color-mix(in oklch, var(--color-map-edge) 30%, transparent);
+  transition:
+    opacity 200ms ease-out,
+    --mode-frame-color 200ms ease-out;
+}
+
+.map-backdrop[data-mode]:not([data-mode="browse"])::after {
+  opacity: 1;
+}
+
+.map-backdrop[data-mode-tone="warn"]::after {
+  --mode-frame-color: var(--color-status-warn);
+}
+
+.map-backdrop[data-mode-tone="ok"]::after {
+  --mode-frame-color: var(--color-status-ok);
+}
+
+.map-backdrop[data-mode-tone="error"]::after {
+  --mode-frame-color: var(--color-status-error);
+}
+
+.map-backdrop[data-mode-tone="idle"]::after {
+  --mode-frame-color: var(--color-status-idle);
+}
+
 @utility surface-accent {
   background-image: linear-gradient(180deg, oklch(0.658 0.15 250), oklch(0.6 0.15 250));
 }
