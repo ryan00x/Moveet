@@ -10,7 +10,7 @@ import { cn } from "@/lib/utils";
  *  • all numerics use `font-mono` + `tabular-nums` (see `mono` helper)
  *  • rows are separated by hairlines (`border-border-soft`), never cards
  *  • labels are 9px uppercase with wide tracking (`Eyebrow`)
- *  • panel content width is fixed by `DockPanel` (w-96) — never set your own
+ *  • panel width is fixed by the surface that opens it — never set your own
  */
 
 /** Apply to any element holding aligned digits (IDs, speeds, ETAs, clocks). */
@@ -60,7 +60,7 @@ export function Eyebrow({
   return (
     <div
       className={cn(
-        "text-[9.5px] font-bold uppercase tracking-[0.18em] text-muted-foreground/75",
+        "text-micro font-semibold uppercase tracking-[0.12em] text-muted-foreground/70",
         className
       )}
     >
@@ -91,11 +91,68 @@ export function PanelHead({
     <div className="flex items-start justify-between gap-3 px-[15px] pb-[11px] pt-[13px]">
       <div className="min-w-0">
         <Eyebrow>{eyebrow}</Eyebrow>
-        <div className="mt-[3px] text-[15px] font-semibold tracking-[-0.01em] text-foreground">
+        <div className="mt-[3px] text-title font-semibold tracking-[-0.01em] text-foreground">
           {title}
         </div>
       </div>
       {right}
+    </div>
+  );
+}
+
+/**
+ * The one header row every floating dock panel wears: what you opened on the
+ * left, the panel's own switch in the middle, an optional caller slot and the
+ * way out on the right.
+ *
+ * It replaced two headings stacked on top of each other — the panel's eyebrow
+ * ("Fleet › List") repeating a tab strip that was already saying the same
+ * thing, over a second `PanelHead` inside the body. One row, one heading.
+ */
+export function PanelHeaderRow({
+  icon,
+  title,
+  children,
+  right,
+  onClose,
+  closeLabel = "Close panel",
+}: {
+  /** Section glyph, sized to the title. */
+  icon?: React.ReactNode;
+  title: string;
+  /** The panel's own switch (a tab strip), taking the middle of the row. */
+  children?: React.ReactNode;
+  /** Caller slot before the close button (a health chip, a count). */
+  right?: React.ReactNode;
+  onClose: () => void;
+  closeLabel?: string;
+}) {
+  return (
+    <div className="flex items-center gap-2 border-b border-border-soft px-2.5 py-[7px]">
+      <div className="flex shrink-0 items-center gap-1.5 text-foreground [&_svg]:size-[15px]">
+        {icon}
+        <span className="whitespace-nowrap text-label font-semibold tracking-[-0.01em]">
+          {title}
+        </span>
+      </div>
+      {children}
+      {right}
+      <button
+        type="button"
+        onClick={onClose}
+        aria-label={closeLabel}
+        title={`${closeLabel} (Esc)`}
+        className={cn(
+          "ml-auto flex size-[22px] shrink-0 items-center justify-center rounded-md",
+          "text-muted-foreground transition-colors duration-fast ease-standard",
+          "hover:bg-foreground/[0.06] hover:text-foreground",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        )}
+      >
+        <svg viewBox="0 0 16 16" aria-hidden className="size-3" fill="none" stroke="currentColor">
+          <path d="M4 4l8 8M12 4l-8 8" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      </button>
     </div>
   );
 }
@@ -105,7 +162,7 @@ export function HealthChip({ tone, children }: { tone: StatusTone; children: Rea
   return (
     <span
       className={cn(
-        "shrink-0 self-center whitespace-nowrap rounded-full border px-2 py-[3px] text-[9.5px] font-bold uppercase tracking-[0.08em]",
+        "shrink-0 self-center whitespace-nowrap rounded-full border px-2 py-[3px] text-micro font-bold uppercase tracking-wider",
         TONE_TEXT[tone],
         tone === "ok" && "border-status-ok/35 bg-status-ok/10",
         tone === "warn" && "border-status-warn/35 bg-status-warn/10",
@@ -152,7 +209,7 @@ export function SegTabs<T extends string>({
             aria-selected={selected}
             onClick={() => onChange(t.value)}
             className={cn(
-              "flex flex-1 items-center justify-center gap-1.5 rounded-md py-[5px] text-[11px] font-medium",
+              "flex flex-1 items-center justify-center gap-1.5 rounded-md py-[5px] text-meta font-medium",
               "transition-[color,background-color,box-shadow] duration-fast ease-standard",
               selected
                 ? "bg-foreground/[0.06] text-foreground shadow-[inset_0_0_0_1px_var(--color-border-soft)]"
@@ -161,7 +218,7 @@ export function SegTabs<T extends string>({
           >
             {t.label}
             {t.count != null && (
-              <span className={cn(mono, "text-[10px] text-muted-foreground/70")}>{t.count}</span>
+              <span className={cn(mono, "text-micro text-muted-foreground/70")}>{t.count}</span>
             )}
           </button>
         );
@@ -171,8 +228,19 @@ export function SegTabs<T extends string>({
 }
 
 /**
+ * The one height envelope every dock panel body lives in. Shared so the panel's
+ * top edge doesn't hop when you step between a section's tabs — a scrolling
+ * body and a virtualized list that needs a definite height both measure the
+ * same cap.
+ */
+export const PANEL_BODY_MAX_H = "max-h-[min(60vh,520px)]";
+
+/** Same envelope as a fixed height, for bodies that must measure (react-window). */
+export const PANEL_BODY_H = "h-[min(60vh,520px)]";
+
+/**
  * Scrollable region for panel bodies that can overflow (lists, tables). Caps
- * at the mockup's comfortable height; the panel surface itself stays put.
+ * at `PANEL_BODY_MAX_H`; the panel surface itself stays put.
  */
 export function PanelScroll({
   children,
@@ -181,7 +249,7 @@ export function PanelScroll({
   children: React.ReactNode;
   className?: string;
 }) {
-  return <div className={cn("max-h-[min(52vh,420px)] overflow-y-auto", className)}>{children}</div>;
+  return <div className={cn(PANEL_BODY_MAX_H, "overflow-y-auto", className)}>{children}</div>;
 }
 
 export interface PanelTab<T extends string> {
@@ -223,7 +291,7 @@ export function PanelTabStrip<T extends string>({
             aria-selected={selected}
             onClick={() => onChange(id)}
             className={cn(
-              "flex-shrink-0 whitespace-nowrap rounded-md px-2 py-1 text-[10.5px] font-medium",
+              "flex-shrink-0 whitespace-nowrap rounded-md px-2 py-1 text-micro font-medium",
               "transition-[color,background-color] duration-fast ease-standard",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-transparent",
               selected
@@ -233,7 +301,7 @@ export function PanelTabStrip<T extends string>({
           >
             {label}
             {badge != null && badge > 0 && (
-              <span className={cn(mono, "ml-1 text-[9px] text-status-error")}>{badge}</span>
+              <span className={cn(mono, "ml-1 text-micro text-status-error")}>{badge}</span>
             )}
           </button>
         );
@@ -270,7 +338,7 @@ export function Tag({ tone, children }: { tone: SevTone; children: React.ReactNo
   return (
     <span
       className={cn(
-        "inline-block rounded-[4px] px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em]",
+        "inline-block rounded-[4px] px-1.5 py-0.5 text-micro font-bold uppercase tracking-wider",
         TAG_TONE[tone]
       )}
     >
@@ -311,9 +379,9 @@ export function LRow({
     >
       <span className={cn("h-[26px] w-[3px] rounded-[2px]", SEV_BAR[tone])} />
       <div className="min-w-0">
-        <div className="truncate text-[12px] font-medium text-foreground">{primary}</div>
+        <div className="truncate text-label font-medium text-foreground">{primary}</div>
         {secondary != null && (
-          <div className={cn(mono, "mt-0.5 truncate text-[10.5px] text-muted-foreground/60")}>
+          <div className={cn(mono, "mt-0.5 truncate text-meta text-muted-foreground/60")}>
             {secondary}
           </div>
         )}

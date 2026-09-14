@@ -8,6 +8,7 @@ import VehicleTelemetry from "./VehicleTelemetry";
 import VehicleEventTimeline from "./VehicleEventTimeline";
 import { useVehicleEventCapture } from "./useVehicleEventCapture";
 import { FAULT_KIND_LABEL } from "@/lib/faultPresets";
+import { useReportInset } from "@/components/Map/mapInsets";
 import type { DeviceFaultInfo } from "@/types";
 
 /**
@@ -45,7 +46,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   return (
     <div className="flex items-baseline justify-between gap-3 border-t border-border-soft px-[15px] py-[9px] first:border-t-0">
       <Eyebrow className="shrink-0">{label}</Eyebrow>
-      <div className="min-w-0 truncate text-right text-[12px] text-foreground">{children}</div>
+      <div className="min-w-0 truncate text-right text-label text-foreground">{children}</div>
     </div>
   );
 }
@@ -114,6 +115,12 @@ export default function Inspector({ vehicle, poi, fleet, job, onClose }: Inspect
   // vehicle selected long after the events happened.
   useVehicleEventCapture();
 
+  // The inspector owns the top-right corner while it is up: its `w-80` (320px)
+  // plus its own `right-3` (12px) plus 12px of air. Reported so flying to the
+  // vehicle it is describing doesn't put that vehicle behind it. Called before
+  // the early return below, so it is unconditional (and clears on close).
+  useReportInset("inspector", vehicle || poi ? { right: 320 + 12 + 12 } : null);
+
   // Escape is deliberately NOT handled here. The inspector is driven by the
   // selection, and Escape-to-clear-selection is one branch of the app's single
   // keyboard dispatcher (useInteractionKeyboard) — a listener here would also
@@ -130,7 +137,13 @@ export default function Inspector({ vehicle, poi, fleet, job, onClose }: Inspect
       role="region"
       aria-label="Inspector"
       className={cn(
-        "absolute right-4 top-4 z-40 flex max-h-[calc(100vh-2rem)] w-80 max-w-[calc(100vw-2rem)] flex-col origin-top-right",
+        // Row two of the shell, the same baseline the legend stack and the
+        // start hint use: `--spacing-row-2` clears the search bar and, with it,
+        // the lamps centred on that row — so an open inspector never covers the
+        // run's health lamps (the bug this replaces). Capped above the dock
+        // shelf the same way it was capped above the viewport edge.
+        "absolute right-3 top-[var(--spacing-row-2)] z-40 flex w-80 max-w-[calc(100vw-2rem)] flex-col origin-top-right",
+        "max-h-[calc(100vh-var(--spacing-row-2)-var(--spacing-above-dock))]",
         "overflow-hidden rounded-[10px] border border-border surface-glass-strong glass-frost-strong shadow-floating",
         "animate-scale-in"
       )}

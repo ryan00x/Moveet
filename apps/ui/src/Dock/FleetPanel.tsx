@@ -6,7 +6,7 @@ import Vehicles from "@/Controls/Vehicles";
 import Fleets from "@/Controls/Fleets";
 import JobsPanel, { type JobsPanelProps } from "@/Controls/JobsPanel";
 import { SuppressPanelHeader } from "@/Controls/PanelPrimitives";
-import { Hairline, PanelScroll, StatusDot, mono } from "./DockPanelKit";
+import { Hairline, PANEL_BODY_H, PanelScroll, StatusDot, mono } from "./DockPanelKit";
 import type { FleetTabId } from "./dockSections";
 
 export interface FleetPanelProps {
@@ -51,27 +51,22 @@ function FleetSummary({
   breached: number;
 }) {
   return (
-    <div
-      className={cn(
-        mono,
-        "flex items-center gap-2.5 whitespace-nowrap px-[15px] py-2 text-[11px] text-muted-foreground"
-      )}
-    >
+    <div className="flex items-center gap-2.5 whitespace-nowrap px-[15px] py-2 text-meta text-muted-foreground">
       <span>
-        <span className="font-semibold text-foreground">{total}</span> total
+        <span className={cn(mono, "font-semibold text-foreground")}>{total}</span> vehicles
       </span>
       <span className="flex items-center gap-1 text-status-ok">
         <StatusDot tone="ok" />
-        <span className="font-semibold">{enroute}</span>
+        <span className={cn(mono, "font-semibold")}>{enroute}</span> moving
       </span>
       <span className="flex items-center gap-1">
         <StatusDot tone="idle" />
-        <span className="font-semibold text-foreground">{idle}</span>
+        <span className={cn(mono, "font-semibold text-foreground")}>{idle}</span> idle
       </span>
       {alert > 0 && (
         <span className="flex items-center gap-1 text-status-warn">
           <StatusDot tone="warn" />
-          <span className="font-semibold">{alert}</span>
+          <span className={cn(mono, "font-semibold")}>{alert}</span> alerts
         </span>
       )}
       {jobs > 0 && (
@@ -82,7 +77,13 @@ function FleetSummary({
           )}
           title={breached > 0 ? `${jobs} live jobs, ${breached} past SLA` : `${jobs} live jobs`}
         >
-          <span className="font-semibold">{jobs}</span> jobs
+          <span className={cn(mono, "font-semibold")}>{jobs}</span> jobs
+          {breached > 0 && (
+            <>
+              {" "}
+              (<span className={cn(mono, "font-semibold")}>{breached}</span> late)
+            </>
+          )}
         </span>
       )}
     </div>
@@ -97,7 +98,7 @@ function FleetSummary({
 function DispatchError({ error }: { error: string | null }) {
   if (!error) return null;
   return (
-    <div className="border-t border-border bg-status-error/[0.07] px-[15px] py-2 text-[11px] leading-tight text-status-error">
+    <div className="border-t border-border bg-status-error/[0.07] px-[15px] py-2 text-meta leading-tight text-status-error">
       {error}
     </div>
   );
@@ -142,17 +143,26 @@ export default function FleetPanel({
     };
   }, [vehicles, dispatch.results]);
 
+  // The roster summary belongs to the views that show the roster. Over Jobs it
+  // was counting one thing while the body listed another, and over Dispatch the
+  // mode rail is already reporting the selection.
+  const showSummary = tab === "list" || tab === "groups";
+
   return (
     <>
-      <FleetSummary
-        total={stats.total}
-        enroute={stats.enroute}
-        idle={stats.idle}
-        alert={stats.alert}
-        jobs={jobs.counts.live}
-        breached={jobs.counts.breached}
-      />
-      <Hairline />
+      {showSummary && (
+        <>
+          <FleetSummary
+            total={stats.total}
+            enroute={stats.enroute}
+            idle={stats.idle}
+            alert={stats.alert}
+            jobs={jobs.counts.live}
+            breached={jobs.counts.breached}
+          />
+          <Hairline />
+        </>
+      )}
 
       {tab === "jobs" ? (
         <PanelScroll>
@@ -174,8 +184,10 @@ export default function FleetPanel({
         </PanelScroll>
       ) : (
         // Bounded height so the virtualized vehicle list measures a real
-        // window (PanelScroll's auto-height would starve react-window).
-        <div className="flex h-[min(50vh,400px)] min-h-0 flex-col">
+        // window (PanelScroll's auto-height would starve react-window) — the
+        // same envelope every other view scrolls inside, so the panel's top
+        // edge doesn't hop as you step between the Fleet views.
+        <div className={cn("flex min-h-0 flex-col", PANEL_BODY_H)}>
           <SuppressPanelHeader>
             <Vehicles
               filter={filter}

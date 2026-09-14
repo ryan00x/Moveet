@@ -8,8 +8,53 @@ import type { Fleet } from "@/types";
 import { vehicleStore } from "@/hooks/vehicleStore";
 import { vehicleEventStore } from "./vehicleEventStore";
 import { TELEMETRY_SAMPLE_MS } from "./telemetry";
+import { getInsets, resetInsets } from "@/components/Map/mapInsets";
 
 beforeEach(() => vehicleEventStore.clear());
+
+describe("the corner the Inspector claims", () => {
+  afterEach(() => resetInsets());
+
+  /**
+   * The camera used to fly the selected vehicle to the raw viewport centre and,
+   * with the inspector up, to a spot the inspector was sitting on. It now
+   * reports its own band so `useDeckViewState` can aim around it.
+   */
+  it("reports its band down the right edge while it is showing something", () => {
+    const { rerender } = render(<Inspector onClose={vi.fn()} />);
+    expect(getInsets().right).toBe(0);
+
+    rerender(<Inspector vehicle={createVehicle({ id: "v1" })} onClose={vi.fn()} />);
+    // Its own width (320) + its right offset (12) + 12px of air.
+    expect(getInsets().right).toBe(344);
+
+    rerender(<Inspector poi={createPOI({ id: "p1" })} onClose={vi.fn()} />);
+    expect(getInsets().right).toBe(344);
+  });
+
+  it("sits on the shared 12px margin and the row-two baseline", () => {
+    render(<Inspector vehicle={createVehicle({ id: "v1" })} onClose={vi.fn()} />);
+    const panel = screen.getByRole("region", { name: "Inspector" });
+    expect(panel.className).toContain("right-3");
+    expect(panel.className).toContain("top-[var(--spacing-row-2)]");
+    // The lamps are centred on the search bar inside row one, so clearing the
+    // row clears them too — no separate below-the-lamps offset any more.
+    expect(panel.className).not.toContain("spacing-below-leds");
+  });
+
+  it("gives the corner back when the selection is cleared, and when it unmounts", () => {
+    const { rerender, unmount } = render(
+      <Inspector vehicle={createVehicle({ id: "v1" })} onClose={vi.fn()} />
+    );
+    rerender(<Inspector onClose={vi.fn()} />);
+    expect(getInsets().right).toBe(0);
+
+    rerender(<Inspector vehicle={createVehicle({ id: "v1" })} onClose={vi.fn()} />);
+    expect(getInsets().right).toBe(344);
+    unmount();
+    expect(getInsets().right).toBe(0);
+  });
+});
 
 describe("Inspector", () => {
   it("renders nothing when neither a vehicle nor a POI is selected", () => {

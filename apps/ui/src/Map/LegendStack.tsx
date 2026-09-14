@@ -16,6 +16,12 @@
  * register their deck.gl layers), so they can't be moved into this subtree.
  * They portal their legend here instead, via `renderInSlot`.
  *
+ * `FleetLegend` is the one exception: App renders it as a sibling of `Map`,
+ * not as a child overlay, and has no way to hand it this stack's slot ref
+ * without a change to App.tsx. `fleets` still has a reserved `LEGEND_ORDER`
+ * slot for when that wiring exists, but today `FleetLegend` positions itself
+ * (see its own file) rather than portalling in.
+ *
  * The wrapper renders unconditionally, so on a quiet map it is an empty,
  * zero-height, click-through box: harmless visually, and it can't hide itself
  * from assistive tech (`aria-hidden` would have to be driven by children it
@@ -45,7 +51,7 @@ export type LegendSlot = RefObject<HTMLElement | null>;
  * `order` fixes the column regardless, and it works across portalled children
  * because they are all real children of the flex container.
  */
-export const LEGEND_ORDER = { density: 0, traffic: 1, heat: 2 } as const;
+export const LEGEND_ORDER = { density: 0, traffic: 1, heat: 2, fleets: 3 } as const;
 
 export type LegendKey = keyof typeof LEGEND_ORDER;
 
@@ -121,22 +127,23 @@ export default function LegendStack({ children, ref }: LegendStackProps) {
       aria-label="Map legends"
       className={[
         // Height budget, measured rather than guessed:
-        //   72px   search bar + its gap (the stack's own top offset)
-        //   88px   --spacing-above-dock, the dock shelf
-        //   448px  --legend-stack-clearance (the visibility rail's band):
-        //          11 keys x 34px = 374, + 10 x 2px gaps = 20, + 8px padding
-        //          = 402, + ~31px for the trail and density chips, + the
-        //          rail's own 12px lift off the shelf.
+        //   74px    --spacing-row-2, the search bar + its gap (the stack's
+        //           own top offset)
+        //   78px    --spacing-above-dock, the dock shelf
+        //   402px   --legend-stack-clearance (the bottom-left column's band,
+        //           the visibility rail's height by definition) — see
+        //           index.css for the breakdown. The map-controls cluster sits
+        //           beside the rail, not above it, so it adds no height.
         // Percentage, not vh: the stack is positioned against the map pane
         // (`map-backdrop`), which is shorter than the viewport by the header.
         // The `max()` floor matters on a short pane: at 608px the subtraction
         // goes negative and a bare calc would clamp the column to nothing,
         // hiding every legend rather than scrolling them.
-        "max-h-[max(140px,calc(100%-72px-var(--spacing-above-dock)-var(--legend-stack-clearance)))]",
+        "max-h-[max(140px,calc(100%-var(--spacing-row-2)-var(--spacing-above-dock)-var(--legend-stack-clearance)))]",
         // Click-through, always: this box covers a tall strip of the map even
         // when it holds one short legend, and the map underneath has to stay
         // draggable.
-        "pointer-events-none absolute left-3 top-[72px] z-10 flex w-[164px] flex-col",
+        "pointer-events-none absolute left-3 top-[var(--spacing-row-2)] z-10 flex w-[164px] flex-col",
       ].join(" ")}
     >
       <div

@@ -129,10 +129,38 @@ describe("VisibilityRail", () => {
   it("stands on the dock shelf rather than floating at mid-height", () => {
     renderRail();
     const rail = screen.getByRole("group", { name: "Layer visibility" });
-    // Legends grow down from the search bar, the rail grows up from the dock.
-    expect(rail.className).toContain("bottom-[calc(var(--spacing-above-dock)+0.75rem)]");
+    // Legends grow down from the search bar, the rail grows up from the dock
+    // shelf it shares with the zoom cluster beside it.
+    expect(rail.className).toContain("bottom-above-dock");
     expect(rail.className).not.toContain("top-1/2");
     expect(rail.className).not.toContain("-translate-y-1/2");
+  });
+
+  it("is the same height whichever keys are lit — badges never reflow the rail", () => {
+    const rail = () => screen.getByRole("group", { name: "Layer visibility" });
+    const keyRows = () => rail().querySelectorAll(":scope > div").length;
+
+    const { unmount } = renderRail();
+    const quiet = keyRows();
+    unmount();
+
+    // Trails on (trail-length badge) and Density lit but starved (threshold
+    // badge) — the two states that used to grow the column.
+    renderRail(
+      { showBreadcrumbs: true, showDensity: true },
+      vi.fn(() => vi.fn()),
+      20
+    );
+
+    expect(keyRows()).toBe(quiet);
+    for (const chip of [
+      screen.getByRole("button", { name: "Trail length" }),
+      screen.getByTestId("density-threshold-chip"),
+    ]) {
+      // Positioned on their key, so they occupy no row of their own.
+      expect(chip.className).toContain("absolute");
+      expect(chip.parentElement?.querySelector(":scope > button")).toBeTruthy();
+    }
   });
 
   describe("density threshold", () => {
@@ -145,6 +173,9 @@ describe("VisibilityRail", () => {
 
       const chip = screen.getByTestId("density-threshold-chip");
       expect(chip).toHaveTextContent(`${DENSITY_MIN_VEHICLES}+`);
+      // A corner badge on the key, not a row under it: in the flow it pushed
+      // every key below Density down ~17px the moment the fleet dipped.
+      expect(chip.className).toContain("absolute");
       // The shorthand is spelled out for anyone who can't see the dimmed key.
       expect(chip).toHaveTextContent(`needs ${DENSITY_MIN_VEHICLES}+ vehicles, 20 now`);
 
@@ -198,6 +229,7 @@ describe("VisibilityRail", () => {
 
       const chip = screen.getByRole("button", { name: "Trail length" });
       expect(chip).toHaveTextContent("60");
+      expect(chip.className).toContain("absolute");
       expect(screen.queryByRole("slider", { name: /trail length/i })).not.toBeInTheDocument();
 
       fireEvent.click(chip);

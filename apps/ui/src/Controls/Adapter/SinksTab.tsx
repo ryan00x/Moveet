@@ -7,7 +7,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Eyebrow, LList, LRow, Tag } from "@/Dock/DockPanelKit";
+import { Eyebrow, LList, LRow, mono, Tag } from "@/Dock/DockPanelKit";
+import { cn } from "@/lib/utils";
 import type { HealthResponse, ConfigResponse } from "./adapterClient";
 import ConfigForm from "./ConfigForm";
 
@@ -47,6 +48,13 @@ export default function SinksTab({ health, config, loading, onAdd, onRemove }: S
 
   return (
     <div>
+      <div className="flex items-center justify-between gap-2 px-[15px] pb-0.5 pt-1">
+        <Eyebrow>Active sinks</Eyebrow>
+        <span className={cn(mono, "text-micro text-muted-foreground/70")}>
+          {activeSinks.length}
+        </span>
+      </div>
+
       <LList>
         {activeSinks.length === 0 && (
           <LRow
@@ -119,7 +127,7 @@ export default function SinksTab({ health, config, loading, onAdd, onRemove }: S
               className="grid grid-cols-[3px_1fr] items-center gap-2.5 border-t border-border-soft px-2 py-[9px] text-left opacity-70 transition-opacity hover:opacity-100"
             >
               <span className="h-[26px] w-[3px] rounded-[2px] bg-border" />
-              <span className="text-[12px] font-medium text-muted-foreground">+ Add sink…</span>
+              <span className="text-label font-medium text-muted-foreground">+ Add sink…</span>
             </button>
           ))}
       </LList>

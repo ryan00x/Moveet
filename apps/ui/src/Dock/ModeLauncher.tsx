@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type { InteractionModeKind } from "@/hooks/useInteractionMode";
@@ -10,6 +9,13 @@ export interface ModeLauncherProps {
   onStart: (kind: InteractionModeKind) => void;
   /** Nothing can be started while the simulator is unreachable. */
   disabled?: boolean;
+  /**
+   * Open state lives in `useDockNavigation`, not here: the launcher, the tempo
+   * panel and an expanded section are three surfaces over the same map, and
+   * only one of them is ever open. Local state let two of them coexist.
+   */
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
 }
 
 /**
@@ -18,12 +24,15 @@ export interface ModeLauncherProps {
  * keep their own entry buttons — this is the surface that makes the set
  * discoverable without knowing which panel owns which tool.
  */
-export default function ModeLauncher({ onStart, disabled = false }: ModeLauncherProps) {
-  const [open, setOpen] = useState(false);
-
+export default function ModeLauncher({
+  onStart,
+  disabled = false,
+  open,
+  onOpenChange,
+}: ModeLauncherProps) {
   return (
     <div className="flex items-center">
-      <Popover open={open} onOpenChange={setOpen}>
+      <Popover open={open} onOpenChange={onOpenChange}>
         <PopoverTrigger asChild>
           <button
             type="button"
@@ -31,7 +40,7 @@ export default function ModeLauncher({ onStart, disabled = false }: ModeLauncher
             aria-label="Start a map action"
             className={cn(
               "flex h-[42px] items-center gap-1.5 rounded-[10px] pl-2.5 pr-3",
-              "text-[12.5px] font-semibold",
+              "text-label font-semibold",
               "transition-[background-color,color,box-shadow] duration-fast ease-standard",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-transparent",
               "disabled:pointer-events-none disabled:opacity-40",
@@ -56,7 +65,7 @@ export default function ModeLauncher({ onStart, disabled = false }: ModeLauncher
                 <button
                   type="button"
                   onClick={() => {
-                    setOpen(false);
+                    onOpenChange(false);
                     onStart(item.kind);
                   }}
                   className={cn(
@@ -69,10 +78,10 @@ export default function ModeLauncher({ onStart, disabled = false }: ModeLauncher
                     {item.icon}
                   </span>
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[12.5px] font-medium text-foreground">
+                    <span className="block truncate text-label font-medium text-foreground">
                       {item.label}
                     </span>
-                    <span className="block truncate text-[11px] text-muted-foreground">
+                    <span className="block truncate text-meta text-muted-foreground">
                       {item.description}
                     </span>
                   </span>

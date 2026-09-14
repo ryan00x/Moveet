@@ -99,7 +99,7 @@ export default function Incidents({ incidents, createRandom, remove, error }: In
               onChange={toggleAutoGenerate}
               aria-label="Auto-generate incidents"
             />
-            <span className="text-xs uppercase tracking-wide text-muted-foreground">Auto</span>
+            <span className="text-meta text-muted-foreground">Auto</span>
           </label>
           <SquaredButton
             icon={<span aria-hidden="true">+</span>}
@@ -113,7 +113,9 @@ export default function Incidents({ incidents, createRandom, remove, error }: In
         </div>
         {error ? <PanelErrorState>{error}</PanelErrorState> : null}
         {incidents.length === 0 && !error ? (
-          <PanelEmptyState icon={<AlertIcon />}>No active incidents</PanelEmptyState>
+          <PanelEmptyState icon={<AlertIcon />}>
+            No active incidents. Press + to create one, or turn on Auto.
+          </PanelEmptyState>
         ) : null}
 
         <LList className="px-0 pb-0 pt-0">
@@ -128,9 +130,7 @@ export default function Incidents({ incidents, createRandom, remove, error }: In
                 meta={
                   <>
                     <Tag tone={tone}>{formatSeverity(incident.severity)}</Tag>
-                    <span
-                      className={cn(mono, "whitespace-nowrap text-[11px] text-muted-foreground")}
-                    >
+                    <span className={cn(mono, "whitespace-nowrap text-meta text-muted-foreground")}>
                       {formatTimeRemaining(incident.expiresAt)}
                     </span>
                     <SquaredButton

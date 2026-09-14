@@ -40,6 +40,16 @@ describe("LegendStack", () => {
     expect(stack.className).toContain("max(140px,");
   });
 
+  it("starts on the shared row-two baseline, not a hand-picked offset", () => {
+    render(<LegendStack />);
+    const stack = screen.getByRole("group", { name: "Map legends" });
+    // One token for every surface that starts below the search bar (the stack,
+    // the start hint, the inspector), and the same token in the height budget.
+    expect(stack.className).toContain("top-[var(--spacing-row-2)]");
+    expect(stack.className).toContain("left-3");
+    expect(stack.className).toContain("var(--spacing-row-2)-var(--spacing-above-dock)");
+  });
+
   it("keeps the column click-through until it actually has to scroll", () => {
     const { container } = render(<LegendStack />);
     const column = container.querySelector("[role='group'] > div") as HTMLElement;
@@ -112,5 +122,9 @@ describe("renderInSlot", () => {
     expect(LEGEND_ORDER.density).toBeLessThan(LEGEND_ORDER.traffic);
     expect(LEGEND_ORDER.traffic).toBeLessThan(LEGEND_ORDER.heat);
     slot.remove();
+  });
+
+  it("reserves the fleets slot after heat", () => {
+    expect(LEGEND_ORDER.heat).toBeLessThan(LEGEND_ORDER.fleets);
   });
 });

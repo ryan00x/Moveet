@@ -43,7 +43,7 @@ vi.mock("@/Controls/Adapter/adapterClient", () => ({
 // Imported after the mocks so the hoisted factories are in place.
 import Dock, { type DockProps } from "./Dock";
 import { useDockNavigation } from "@/hooks/useDockNavigation";
-import { createDockProps } from "@/test/dockProps";
+import { createDockProps, passthroughGuard } from "@/test/dockProps";
 import { DOCK_SECTIONS, rollUpBadge, type DockBadges } from "./dockSections";
 
 function renderDock(overrides: Partial<Omit<DockProps, "navigation">> = {}) {
@@ -58,6 +58,68 @@ const pill = (name: string) => screen.getByRole("button", { name });
 const expanded = (name: string) => pill(name).getAttribute("aria-expanded") === "true";
 const tabNames = () => screen.queryAllByRole("tab").map((t) => t.textContent?.trim());
 
+const wingColumn = () => document.querySelector("[data-dock-wing='sections']") as HTMLElement;
+const wingKeys = () =>
+  Array.from(document.querySelectorAll("[data-dock='sections'] button")).map((b) =>
+    b.getAttribute("aria-label")
+  );
+
+describe("the section wing's place on the row", () => {
+  /**
+   * The wing used to be packed against the deck (`justify-start` in its column),
+   * so it slid left and right by ~100px every time the deck changed width —
+   * entering dispatch swaps the live run's keys for a much wider mode rail, and
+   * the discard prompt is wider again. Four keys that move whenever something
+   * else happens are four keys muscle memory can't hold. It is now pinned to the
+   * viewport's right edge, which nothing on the deck can reach.
+   *
+   * jsdom has no layout, so this asserts the rule (the alignment class) and the
+   * consequence (same keys, same order) rather than measuring pixels.
+   */
+  it("hangs off the viewport's right edge, not off the deck's", () => {
+    renderDock();
+    expect(wingColumn().className).toContain("justify-end");
+    expect(wingColumn().className).not.toContain("justify-start");
+  });
+
+  it("stands on the shell's one 12px outer margin", () => {
+    renderDock();
+    // The row, the lamps, the inspector, the legend stack and the rail all sit
+    // 12px off their edge, so the section panel's own FLOAT_MARGIN (12) lands
+    // its right edge exactly on the wing's.
+    const row = wingColumn().parentElement as HTMLElement;
+    expect(row.className).toContain("inset-x-3");
+    expect(row.className).toContain("bottom-3");
+  });
+
+  it("keeps the same four keys in the same order whatever the deck is doing", () => {
+    const live = renderDock();
+    expect(wingKeys()).toEqual(["Fleet", "Monitor", "Session", "Settings"]);
+    live.unmount();
+
+    // Mid-mode: the deck is carrying a mode rail instead of the run's keys.
+    const inMode = renderDock({
+      modeDescriptor: {
+        kind: "drawZone",
+        label: "Heat zone",
+        tone: "accent",
+        status: "Drawing",
+        actions: [],
+      } as unknown as DockProps["modeDescriptor"],
+    });
+    expect(wingColumn().className).toContain("justify-end");
+    expect(wingKeys()).toEqual(["Fleet", "Monitor", "Session", "Settings"]);
+    inMode.unmount();
+
+    // Being asked to discard: the deck becomes a prompt, wider again.
+    renderDock({
+      guard: { ...passthroughGuard(), pending: { loses: "4-point zone", run: vi.fn() } },
+    });
+    expect(wingColumn().className).toContain("justify-end");
+    expect(wingKeys()).toEqual(["Fleet", "Monitor", "Session", "Settings"]);
+  });
+});
+
 describe("dock section row", () => {
   it("rests as four labelled pills, none expanded", () => {
     renderDock();
@@ -68,7 +130,7 @@ describe("dock section row", () => {
     expect(screen.queryAllByRole("tab")).toHaveLength(0);
   });
 
-  it("unfolds the selected key's own buttons beside it", async () => {
+  it("opens the selected key's panel, with that section's views in its header", async () => {
     const user = userEvent.setup();
     renderDock();
 
@@ -77,6 +139,34 @@ describe("dock section row", () => {
     // The key stays a key — it lights up rather than becoming something else.
     expect(pill("Monitor")).toHaveAttribute("aria-expanded", "true");
     expect(tabNames()).toEqual(["Incidents", "Analytics", "Geofences", "Heat zones", "Faults"]);
+
+    // …and the views live in the panel, not in the bar: the wing is always the
+    // four keys, whatever is open.
+    const panel = screen.getByRole("region", { name: "Monitor" });
+    expect(within(panel).getAllByRole("tab")).toHaveLength(5);
+    const wing = document.querySelector('[data-dock="sections"]') as HTMLElement;
+    expect(within(wing).getAllByRole("button")).toHaveLength(4);
+    expect(within(wing).queryAllByRole("tab")).toHaveLength(0);
+  });
+
+  it("keeps the wing's four keys the same shape whichever section is open", async () => {
+    const user = userEvent.setup();
+    renderDock();
+
+    const wing = document.querySelector('[data-dock="sections"]') as HTMLElement;
+    const names = () =>
+      within(wing)
+        .getAllByRole("button")
+        .map((b) => `${b.getAttribute("aria-label")}:${b.getAttribute("aria-expanded")}`);
+
+    expect(names()).toEqual(["Fleet:false", "Monitor:false", "Session:false", "Settings:false"]);
+
+    await user.click(pill("Monitor"));
+    // One key lights; nothing is added, removed or reordered around it.
+    expect(names()).toEqual(["Fleet:false", "Monitor:true", "Session:false", "Settings:false"]);
+
+    await user.click(pill("Settings"));
+    expect(names()).toEqual(["Fleet:false", "Monitor:false", "Session:false", "Settings:true"]);
   });
 
   it("collapses from the lit key it expanded from", async () => {
@@ -151,15 +241,76 @@ describe("dock section row", () => {
     expect(screen.getByRole("button", { name: "Start a map action" })).toBeInTheDocument();
   });
 
-  it("anchors the panel to the section that opened it", async () => {
+  it("gives the panel one header: the section, its views, and the way out", async () => {
     const user = userEvent.setup();
     renderDock();
 
     await user.click(pill("Session"));
 
     const panel = await screen.findByRole("region", { name: "Session" });
-    expect(within(panel).queryAllByRole("tab")).toHaveLength(0);
     expect(panel).toHaveAttribute("id", "dock-section-panel");
+    // The eyebrow that used to repeat the lit view ("SESSION › RECORDINGS") is
+    // gone: the header names the section once and the tab strip says the rest.
+    expect(panel).not.toHaveTextContent("›");
+    expect(
+      within(panel)
+        .getAllByRole("tab")
+        .map((t) => t.textContent)
+    ).toEqual(["Recordings", "Scenarios"]);
+
+    await user.click(within(panel).getByRole("button", { name: "Close Session" }));
+    expect(expanded("Session")).toBe(false);
+  });
+
+  it("gives Monitor's five views room to spell themselves out", async () => {
+    const user = userEvent.setup();
+    renderDock();
+
+    await user.click(pill("Monitor"));
+    const panel = await screen.findByRole("region", { name: "Monitor" });
+
+    // One width for every section, wide enough for the longest header: the
+    // title, five tabs, a badge and the close button. At 460px "Faults" clipped
+    // to "Fau" the moment the Incidents badge appeared.
+    expect(panel.className).toContain("w-[520px]");
+    expect(
+      within(panel)
+        .getAllByRole("tab")
+        .map((t) => t.textContent)
+    ).toEqual(["Incidents", "Analytics", "Geofences", "Heat zones", "Faults"]);
+    // Tabs never shrink or wrap — a clipped tab is worse than a tight strip.
+    for (const tab of within(panel).getAllByRole("tab")) {
+      expect(tab.className).toContain("shrink-0");
+      expect(tab.className).toContain("whitespace-nowrap");
+    }
+  });
+
+  it("opens one floating surface at a time: launcher, tempo, or a section", async () => {
+    const user = userEvent.setup();
+    renderDock();
+
+    const launcher = () => screen.getByRole("button", { name: "Start a map action" });
+    const tempo = () => screen.getByRole("button", { name: /^Tempo/ });
+    const isOpen = (b: HTMLElement) => b.getAttribute("aria-expanded") === "true";
+
+    await user.click(launcher());
+    expect(isOpen(launcher())).toBe(true);
+
+    // Tempo takes the launcher away…
+    await user.click(tempo());
+    expect(isOpen(tempo())).toBe(true);
+    expect(isOpen(launcher())).toBe(false);
+
+    // …a section takes tempo away…
+    await user.click(pill("Fleet"));
+    expect(expanded("Fleet")).toBe(true);
+    expect(isOpen(tempo())).toBe(false);
+    expect(isOpen(launcher())).toBe(false);
+
+    // …and the launcher collapses the section.
+    await user.click(launcher());
+    expect(isOpen(launcher())).toBe(true);
+    expect(expanded("Fleet")).toBe(false);
   });
 
   it("badges the tab that owns the count, and rolls it up onto the collapsed pill", async () => {
