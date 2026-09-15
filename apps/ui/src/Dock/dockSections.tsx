@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { CarIcon, ChartIcon, GaugeIcon, RecordCircleIcon } from "@/components/Icons";
+import { CarIcon, ChartIcon, GaugeIcon, InspectIcon, RecordCircleIcon } from "@/components/Icons";
 
 /**
  * The dock's sections and the buttons each one expands into.
@@ -14,14 +14,21 @@ import { CarIcon, ChartIcon, GaugeIcon, RecordCircleIcon } from "@/components/Ic
  * command palette all read, so a new tab is one entry here plus its content.
  */
 
-export type DockSectionId = "fleet" | "monitor" | "session" | "settings";
+export type DockSectionId = "fleet" | "monitor" | "session" | "settings" | "inspect";
 
 export type FleetTabId = "list" | "groups" | "dispatch" | "jobs";
-export type MonitorTabId = "incidents" | "analytics" | "geofences" | "heatzones" | "faults";
+export type MonitorTabId =
+  | "incidents"
+  | "events"
+  | "analytics"
+  | "geofences"
+  | "heatzones"
+  | "faults";
 export type SessionTabId = "recordings" | "scenarios";
 export type SettingsTabId = "source" | "sinks" | "realism" | "advanced";
+export type InspectTabId = "detail";
 
-export type DockTabId = FleetTabId | MonitorTabId | SessionTabId | SettingsTabId;
+export type DockTabId = FleetTabId | MonitorTabId | SessionTabId | SettingsTabId | InspectTabId;
 
 export interface DockTab {
   id: DockTabId;
@@ -34,14 +41,9 @@ export interface DockSection {
   label: string;
   icon: ReactNode;
   tabs: DockTab[];
-  /**
-   * Width of the panel this section opens. Per-section, because one 384px box
-   * for every panel is what forced the vehicle list into a fixed-height hack
-   * and squeezed the analytics charts.
-   */
-  panelWidth: string;
 }
 
+/** The four keys on the dock's wing, in order. */
 export const DOCK_SECTIONS: DockSection[] = [
   {
     id: "fleet",
@@ -53,7 +55,6 @@ export const DOCK_SECTIONS: DockSection[] = [
       { id: "dispatch", label: "Dispatch" },
       { id: "jobs", label: "Jobs" },
     ],
-    panelWidth: "w-[420px]",
   },
   {
     id: "monitor",
@@ -61,13 +62,12 @@ export const DOCK_SECTIONS: DockSection[] = [
     icon: <ChartIcon />,
     tabs: [
       { id: "incidents", label: "Incidents" },
+      { id: "events", label: "Events" },
       { id: "analytics", label: "Analytics" },
       { id: "geofences", label: "Geofences" },
       { id: "heatzones", label: "Heat zones" },
       { id: "faults", label: "Faults" },
     ],
-    // Analytics carries charts; they were the worst served by the old shared box.
-    panelWidth: "w-[480px]",
   },
   {
     id: "session",
@@ -77,7 +77,6 @@ export const DOCK_SECTIONS: DockSection[] = [
       { id: "recordings", label: "Recordings" },
       { id: "scenarios", label: "Scenarios" },
     ],
-    panelWidth: "w-[400px]",
   },
   {
     id: "settings",
@@ -91,11 +90,33 @@ export const DOCK_SECTIONS: DockSection[] = [
       { id: "realism", label: "Realism" },
       { id: "advanced", label: "Advanced" },
     ],
-    panelWidth: "w-[380px]",
   },
 ];
 
-const SECTION_BY_ID = new Map(DOCK_SECTIONS.map((section) => [section.id, section]));
+/**
+ * What the map has selected, as a section of its own.
+ *
+ * It is deliberately NOT in `DOCK_SECTIONS`, so it has no key on the dock's
+ * wing. The other four are places you decide to go; this one is where you
+ * already are — it opens because something was selected, and a key for it
+ * would be lit-and-empty most of the run. Everything else about it is an
+ * ordinary section: the console shows it, `dockSection` resolves it, and the
+ * navigation state remembers it.
+ *
+ * It is also the one section allowed to render empty, which is why the
+ * selection can be cleared without closing the console.
+ */
+export const INSPECT_SECTION: DockSection = {
+  id: "inspect",
+  label: "Inspect",
+  icon: <InspectIcon />,
+  tabs: [{ id: "detail", label: "Detail" }],
+};
+
+/** Every section the console can show — the wing's four, plus Inspect. */
+export const CONSOLE_SECTIONS: DockSection[] = [...DOCK_SECTIONS, INSPECT_SECTION];
+
+const SECTION_BY_ID = new Map(CONSOLE_SECTIONS.map((section) => [section.id, section]));
 
 export function dockSection(id: DockSectionId): DockSection {
   const section = SECTION_BY_ID.get(id);

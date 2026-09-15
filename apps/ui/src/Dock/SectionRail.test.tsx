@@ -41,17 +41,13 @@ vi.mock("@/Controls/Adapter/adapterClient", () => ({
 }));
 
 // Imported after the mocks so the hoisted factories are in place.
-import Dock, { type DockProps } from "./Dock";
-import { useDockNavigation } from "@/hooks/useDockNavigation";
-import { createDockProps, passthroughGuard } from "@/test/dockProps";
+import { passthroughGuard, renderDockShell, type DockShellProps } from "@/test/dockProps";
 import { DOCK_SECTIONS, rollUpBadge, type DockBadges } from "./dockSections";
+import { CONSOLE_MIN_WIDTH } from "@/shell/Console/useConsoleSize";
 
-function renderDock(overrides: Partial<Omit<DockProps, "navigation">> = {}) {
-  function Harness() {
-    const navigation = useDockNavigation();
-    return <Dock {...createDockProps(overrides)} navigation={navigation} />;
-  }
-  return render(<Harness />);
+// The keys and the console they open are one surface — see `DockShell`.
+function renderDock(overrides: Partial<DockShellProps> = {}) {
+  return renderDockShell(overrides);
 }
 
 const pill = (name: string) => screen.getByRole("button", { name });
@@ -82,14 +78,18 @@ describe("the section wing's place on the row", () => {
     expect(wingColumn().className).not.toContain("justify-start");
   });
 
-  it("stands on the shell's one 12px outer margin", () => {
+  it("takes its outer margin from the shell grid, not from its own insets", () => {
     renderDock();
-    // The row, the lamps, the inspector, the legend stack and the rail all sit
-    // 12px off their edge, so the section panel's own FLOAT_MARGIN (12) lands
-    // its right edge exactly on the wing's.
+    // The one 12px margin now lives on the grid that holds every edge-anchored
+    // surface (see `ShellGrid`), so the row is in flow inside the bottom track
+    // rather than pinned to the map with insets of its own.
     const row = wingColumn().parentElement as HTMLElement;
-    expect(row.className).toContain("inset-x-3");
-    expect(row.className).toContain("bottom-3");
+    expect(row.className).not.toContain("absolute");
+    expect(row.className).not.toContain("inset-x-3");
+    expect(row.className).not.toContain("bottom-3");
+    // The three-column template is the part that is still the row's own: it is
+    // what holds the deck on the viewport's centre line.
+    expect(row.className).toContain("grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]");
   });
 
   it("keeps the same four keys in the same order whatever the deck is doing", () => {
@@ -138,12 +138,19 @@ describe("dock section row", () => {
 
     // The key stays a key — it lights up rather than becoming something else.
     expect(pill("Monitor")).toHaveAttribute("aria-expanded", "true");
-    expect(tabNames()).toEqual(["Incidents", "Analytics", "Geofences", "Heat zones", "Faults"]);
+    expect(tabNames()).toEqual([
+      "Incidents",
+      "Events",
+      "Analytics",
+      "Geofences",
+      "Heat zones",
+      "Faults",
+    ]);
 
     // …and the views live in the panel, not in the bar: the wing is always the
     // four keys, whatever is open.
     const panel = screen.getByRole("region", { name: "Monitor" });
-    expect(within(panel).getAllByRole("tab")).toHaveLength(5);
+    expect(within(panel).getAllByRole("tab")).toHaveLength(6);
     const wing = document.querySelector('[data-dock="sections"]') as HTMLElement;
     expect(within(wing).getAllByRole("button")).toHaveLength(4);
     expect(within(wing).queryAllByRole("tab")).toHaveLength(0);
@@ -248,7 +255,7 @@ describe("dock section row", () => {
     await user.click(pill("Session"));
 
     const panel = await screen.findByRole("region", { name: "Session" });
-    expect(panel).toHaveAttribute("id", "dock-section-panel");
+    expect(panel).toHaveAttribute("id", "console-panel");
     // The eyebrow that used to repeat the lit view ("SESSION › RECORDINGS") is
     // gone: the header names the section once and the tab strip says the rest.
     expect(panel).not.toHaveTextContent("›");
@@ -262,7 +269,7 @@ describe("dock section row", () => {
     expect(expanded("Session")).toBe(false);
   });
 
-  it("gives Monitor's five views room to spell themselves out", async () => {
+  it("gives Monitor's six views room to spell themselves out", async () => {
     const user = userEvent.setup();
     renderDock();
 
@@ -270,14 +277,18 @@ describe("dock section row", () => {
     const panel = await screen.findByRole("region", { name: "Monitor" });
 
     // One width for every section, wide enough for the longest header: the
-    // title, five tabs, a badge and the close button. At 460px "Faults" clipped
+    // At 460px "Faults" clipped
     // to "Fau" the moment the Incidents badge appeared.
-    expect(panel.className).toContain("w-[520px]");
+    // Width is the operator's now, not the section's: the console is dragged
+    // to taste and remembered (see `useConsoleSize`). What the suite can still
+    // pin is that it opens wide enough for the widest header — Monitor's, with
+    // a title, five tabs, a badge and a close button.
+    expect(Number.parseInt(panel.style.width, 10)).toBeGreaterThanOrEqual(CONSOLE_MIN_WIDTH);
     expect(
       within(panel)
         .getAllByRole("tab")
         .map((t) => t.textContent)
-    ).toEqual(["Incidents", "Analytics", "Geofences", "Heat zones", "Faults"]);
+    ).toEqual(["Incidents", "Events", "Analytics", "Geofences", "Heat zones", "Faults"]);
     // Tabs never shrink or wrap — a clipped tab is worse than a tight strip.
     for (const tab of within(panel).getAllByRole("tab")) {
       expect(tab.className).toContain("shrink-0");

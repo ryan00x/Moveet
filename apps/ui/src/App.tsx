@@ -1,11 +1,16 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import client from "./utils/client";
 import Dock from "./Dock/Dock";
-import Inspector from "./Inspector/Inspector";
 import useTracking from "./Controls/useTracking";
 import MapView from "./Map/Map";
 import VisibilityRail from "./Map/VisibilityRail";
 import SearchBar from "./SearchBar";
+import ShellGrid from "./shell/ShellGrid";
+import ConsoleSections from "./shell/Console/ConsoleSections";
+import { buildDockBadges } from "./Dock/dockBadges";
+import type { DockTabId } from "./Dock/dockSections";
+import Region from "./shell/Region";
+import LegendStack from "./Map/LegendStack";
 import Zoom from "./Zoom/";
 import CreateZoneDialog from "./Map/Geofence/CreateZoneDialog";
 import { useHeatzoneEditorContext } from "./data/HeatzoneEditorContext";
@@ -13,7 +18,7 @@ import { useHeatzones } from "./hooks/useHeatzones";
 import { useHeatzoneAutoReveal } from "./hooks/useHeatzoneAutoReveal";
 import type { Fleet, Modifiers } from "./types";
 import type { BoundingBox } from "@moveet/shared-types";
-import type { POI } from "./types";
+import type { POI, Road } from "./types";
 import { isRoad } from "./utils/typeGuards";
 import { useVehicles } from "./hooks/useVehicles";
 import { useFleets } from "./hooks/useFleets";
@@ -53,7 +58,7 @@ import CommandPalette, { buildCommands } from "./components/CommandPalette";
 import StatusLeds from "./Dock/StatusLeds";
 import { useAdapterConfig } from "./Controls/Adapter/useAdapterConfig";
 import { FEED_HEALTH_TONE, feedHealth } from "./Dock/FeedsSection";
-import SessionTimeline, { useSessionEventCapture } from "./components/SessionTimeline";
+import { useSessionEventCapture } from "./components/SessionEvents";
 import LoadingOverlay from "./components/LoadingOverlay";
 import StartHint from "./components/StartHint";
 import { useVersionCheck } from "./hooks/useVersionCheck";
@@ -245,9 +250,51 @@ export default function App() {
     onJobPlacementClick: jobDraft.handleMapClick,
   });
 
+  // ─── Revealing what was selected ────────────────────────────────
+  // Selecting something is a request to look at it, so it opens the console on
+  // the Inspect view — but only when the operator asked for it in words: from
+  // the fleet list, from search, from the palette.
+  //
+  // A click on the *map* deliberately does not open the console. It would take
+  // 420px of map away on every click, including the ones that were only meant
+  // to pick a dispatch target; so a map click switches the view when the
+  // console is already open and otherwise leaves the screen alone.
+  const revealInspector = useCallback(() => dockNavigation.open("inspect"), [dockNavigation]);
+  const revealInspectorIfOpen = useCallback(() => {
+    if (dockNavigation.expanded !== null) dockNavigation.open("inspect");
+  }, [dockNavigation]);
+
+  const onSelectVehicleFromList = useCallback(
+    (id: string) => {
+      onSelectVehicle(id);
+      revealInspector();
+    },
+    [onSelectVehicle, revealInspector]
+  );
+  const onSelectVehicleFromMap = useCallback(
+    (id: string) => {
+      onSelectVehicle(id);
+      revealInspectorIfOpen();
+    },
+    [onSelectVehicle, revealInspectorIfOpen]
+  );
+  const onSelectItemFromList = useCallback(
+    (item: Road | POI | null) => {
+      setSelectedItem(item);
+      if (item) revealInspector();
+    },
+    [setSelectedItem, revealInspector]
+  );
+
   // Stable so the POI IconLayer's onClick-keyed useMemo isn't rebuilt each render
   // (which would discard deck.gl's in-flight enter/color transitions).
-  const onPOIClick = useCallback((poi: POI) => setSelectedItem(poi), [setSelectedItem]);
+  const onPOIClick = useCallback(
+    (poi: POI) => {
+      setSelectedItem(poi);
+      revealInspectorIfOpen();
+    },
+    [setSelectedItem, revealInspectorIfOpen]
+  );
 
   // Canvas hover on a vehicle mirrors the sidebar list's onMouseEnter/Leave pair.
   const onHoverMapVehicle = useCallback(
@@ -290,10 +337,15 @@ export default function App() {
     [filters.selected, vehicles]
   );
   const selectedPoi = selectedItem && !isRoad(selectedItem) ? selectedItem : undefined;
-  const closeInspector = useCallback(() => {
-    onUnselectVehicle();
-    setSelectedItem(null);
-  }, [onUnselectVehicle, setSelectedItem]);
+  const inspectorTarget = useMemo(
+    () => ({
+      vehicle: selectedVehicle,
+      poi: selectedPoi ?? undefined,
+      fleet: selectedVehicle ? vehicleFleetMap.get(selectedVehicle.id) : undefined,
+      job: selectedVehicle ? jobs.jobByVehicleId.get(selectedVehicle.id) : undefined,
+    }),
+    [selectedVehicle, selectedPoi, vehicleFleetMap, jobs.jobByVehicleId]
+  );
 
   // ─── First-run start affordance ─────────────────────────────────
   // The sim boots paused; StartHint owns its own (one-shot) visibility, this
@@ -551,6 +603,52 @@ export default function App() {
     ]
   );
 
+  // ─── Section badges and tab selection ───────────────────────────
+  // The dock's four keys and the console's tab bar are two ways into the same
+  // sections, so the counts on them are built once here (see `dockBadges`)
+  // rather than twice from two copies of the rules.
+  const badges = useMemo(
+    () =>
+      buildDockBadges({
+        dispatch,
+        breachedJobs: jobs.counts.breached,
+        openIncidents: incidents.incidents.length,
+        faults,
+        isRecording: recording.isRecording,
+      }),
+    [dispatch, jobs.counts.breached, incidents.incidents.length, faults, recording.isRecording]
+  );
+
+  // Selecting a Fleet tab is also a mode decision: Dispatch enters dispatch
+  // mode (through the guard), and stepping off it leaves. A half-placed job is
+  // deliberately NOT cancelled by leaving the Jobs tab — the mode rail reports
+  // it and owns Escape, so it can no longer become invisible.
+  const onSelectTab = useCallback(
+    (next: DockTabId) => {
+      if (dockNavigation.expanded === "fleet") {
+        if (next === "dispatch") {
+          enterDispatchGuarded();
+          return;
+        }
+        if (dispatch.dispatchMode) handleDone();
+      }
+      dockNavigation.selectTab(next);
+    },
+    [dockNavigation, dispatch.dispatchMode, enterDispatchGuarded, handleDone]
+  );
+
+  // Dispatch started elsewhere (the launcher, D, the palette): light the tab
+  // that owns it so the console never contradicts the mode rail.
+  useEffect(() => {
+    if (
+      dispatch.dispatchMode &&
+      dockNavigation.expanded === "fleet" &&
+      dockNavigation.tab !== "dispatch"
+    ) {
+      dockNavigation.selectTab("dispatch");
+    }
+  }, [dispatch.dispatchMode, dockNavigation]);
+
   return (
     // Panels several levels down (the heat-zone tab, the geofence tab, the job
     // board) start map modes; the provider gives them the same guarded entry
@@ -583,7 +681,7 @@ export default function App() {
                 filters={filters}
                 modifiers={modifiers}
                 selectedItem={selectedItem}
-                onClick={onSelectVehicle}
+                onClick={onSelectVehicleFromMap}
                 onMapClick={onMapClick}
                 onMapContextClick={onMapContextClick}
                 onPOIClick={onPOIClick}
@@ -613,148 +711,113 @@ export default function App() {
                 onBboxChange={onBboxChange}
                 panLocked={heatzoneEditor.mode !== "idle"}
               />
-              {/* The search bar and the mode banner share the top-center slot:
-                while a mode is active the banner replaces the search bar (mode
-                clicks and search-driven selection would conflict). */}
-              {!mapLoading && interaction.mode.kind === "browse" && (
-                <SearchBar
-                  selectedItem={selectedItem}
-                  onDestinationClick={onDestinationClick}
-                  onItemSelect={(item) => setSelectedItem(item)}
-                  onItemUnselect={() => setSelectedItem(null)}
-                  vehicles={vehicles}
-                  onSelectVehicle={onSelectVehicle}
-                />
-              )}
-              <Zoom />
-              {/* Layer visibility and the vehicle-type filters own the left edge
-                  as icon keys — see VisibilityRail. Between them they replaced
-                  the Settings › Visibility tab and the bottom-left type legend. */}
-              <VisibilityRail
-                modifiers={modifiers}
-                onChangeModifiers={onChangeModifiers}
-                hiddenVehicleTypes={hiddenVehicleTypes}
-                onToggleVehicleType={toggleVehicleType}
-                vehicleCount={vehicles.length}
-              />
-              <StartHint
-                running={status.running}
-                ready={!mapLoading && connected}
-                onStart={onStartFromHint}
-              />
-              {/* Health lamps live in the corner, away from anything pressed. */}
-              <StatusLeds
-                leds={[
-                  {
-                    key: "ws",
-                    label: "WS",
-                    tone: connected ? "ok" : "idle",
-                    title: connected ? "Live socket connected" : "Live socket disconnected",
-                  },
-                  {
-                    key: "sim",
-                    label: "SIM",
-                    tone: status.running ? "ok" : "idle",
-                    title: status.running ? "Simulation running" : "Simulation paused",
-                  },
-                  {
-                    key: "feed",
-                    label: "FEED",
-                    tone: FEED_HEALTH_TONE[feedHealth(adapter.health)],
-                    title: `Adapter feeds: ${feedHealth(adapter.health).toLowerCase()}`,
-                  },
-                ]}
-              />
-              <Dock
-                navigation={dockNavigation}
-                adapter={adapter}
-                status={status}
-                options={options}
-                connected={connected}
-                modeDescriptor={modeDescriptor}
-                guard={guard}
-                onStartMode={startMode}
-                onEnterDispatch={enterDispatchGuarded}
-                onExitDispatch={handleDone}
-                isRecording={recording.isRecording}
-                onStartRecording={recording.startRecording}
-                onStopRecording={recording.stopRecording}
-                replayStatus={replay.replayStatus}
-                onPauseReplay={replay.pauseReplay}
-                onResumeReplay={replay.resumeReplay}
-                onStopReplay={replay.stopReplay}
-                onSeekReplay={replay.seekReplay}
-                onSetReplaySpeed={replay.setReplaySpeed}
-                vehicles={vehicles}
-                filter={filters.filter}
-                onFilterChange={onFilterChange}
-                selectedId={filters.selected}
-                onSelectVehicle={onSelectVehicle}
-                onHoverVehicle={onHoverVehicle}
-                onUnhoverVehicle={onUnhoverVehicle}
-                maxSpeed={maxSpeedRef.current}
-                vehicleFleetMap={vehicleFleetMap}
-                fleets={fleets}
-                onCreateFleet={createFleet}
-                onDeleteFleet={deleteFleet}
-                onAssignVehicle={assignVehicle}
-                onUnassignVehicle={unassignVehicle}
-                fleetsError={fleetsError}
-                dispatch={dispatch}
-                jobs={{
-                  jobs: jobs.jobs,
-                  counts: jobs.counts,
-                  // Starting a placement goes through the guard like every other
-                  // way into a mode; cancelling and the rest are the draft's own.
-                  draft: { ...jobDraft, start: startJobGuarded },
-                  onCancelJob: jobs.cancelJob,
-                  onDeleteJob: jobs.deleteJob,
-                  onAssignJob: jobs.assignJob,
-                  vehicles,
-                  jobByVehicleId: jobs.jobByVehicleId,
-                  error: jobs.error,
-                }}
-                incidents={{
-                  incidents: incidents.incidents,
-                  createRandom: incidents.createRandom,
-                  remove: incidents.remove,
-                  error: incidents.error,
-                }}
-                faults={{
-                  faults,
-                  vehicles,
-                  selectedVehicleId: filters.selected,
-                }}
-                geofences={{
-                  fences: geofences.fences,
-                  onFenceToggle: geofences.onFenceToggle,
-                  onFenceDelete: geofences.onFenceDelete,
-                  alerts: geofences.alerts,
-                  drawingActive: geofences.drawingActive,
-                  vertexCount: geofences.drawingVertexCount,
-                  onStartDrawing: startGeofenceDrawingGuarded,
-                  onCancelDrawing: geofences.onDrawCancel,
-                  onConfirmDrawing: geofences.onConfirmDraw,
-                }}
-                analytics={{
-                  summary: analytics.summary,
-                  fleetHistory: analytics.fleetHistory,
-                  summaryHistory: analytics.summaryHistory,
-                }}
-                recordings={{
-                  recordings: recording.recordings,
-                  replayStatus: replay.replayStatus,
-                  onStartReplay: replay.startReplay,
-                  onRefreshRecordings: recording.refreshRecordings,
-                }}
-                advanced={{ maxSpeedRef }}
-              />
-              <Inspector
-                vehicle={selectedVehicle}
-                poi={selectedPoi ?? undefined}
-                fleet={selectedVehicle ? vehicleFleetMap.get(selectedVehicle.id) : undefined}
-                job={selectedVehicle ? jobs.jobByVehicleId.get(selectedVehicle.id) : undefined}
-                onClose={closeInspector}
+              <ShellGrid
+                /* The search bar and the mode banner share the top-centre
+                   track: while a mode is active the banner replaces the search
+                   bar (mode clicks and search-driven selection would
+                   conflict). */
+                topCenter={
+                  <Region open={!mapLoading && interaction.mode.kind === "browse"} justify="center">
+                    <SearchBar
+                      selectedItem={selectedItem}
+                      onDestinationClick={onDestinationClick}
+                      onItemSelect={onSelectItemFromList}
+                      onItemUnselect={() => setSelectedItem(null)}
+                      vehicles={vehicles}
+                      onSelectVehicle={onSelectVehicleFromList}
+                    />
+                  </Region>
+                }
+                /* Health lamps live in the corner, away from anything pressed,
+                   centred on the search band rather than hung off the top
+                   edge. */
+                topRight={
+                  <Region justify="end" align="center">
+                    <StatusLeds
+                      leds={[
+                        {
+                          key: "ws",
+                          label: "WS",
+                          tone: connected ? "ok" : "idle",
+                          title: connected ? "Live socket connected" : "Live socket disconnected",
+                        },
+                        {
+                          key: "sim",
+                          label: "SIM",
+                          tone: status.running ? "ok" : "idle",
+                          title: status.running ? "Simulation running" : "Simulation paused",
+                        },
+                        {
+                          key: "feed",
+                          label: "FEED",
+                          tone: FEED_HEALTH_TONE[feedHealth(adapter.health)],
+                          title: `Adapter feeds: ${feedHealth(adapter.health).toLowerCase()}`,
+                        },
+                      ]}
+                    />
+                  </Region>
+                }
+                /* The left column, top to bottom: the legend stack, then the
+                   instruments that stand on the floor of the map. They share
+                   one column and one left edge, and the column is exactly the
+                   height the grid leaves between the search band and the dock
+                   — which is what used to take three clearance tokens to
+                   approximate. Click-through as a whole; the rail and the
+                   cluster take the pointer back for their own boxes. */
+                left={
+                  <Region
+                    justify="start"
+                    align="stretch"
+                    interactive={false}
+                    className="flex flex-col justify-between gap-3"
+                  >
+                    <LegendStack />
+                    <div className="pointer-events-auto flex shrink-0 flex-col items-start gap-2">
+                      {/* Layer visibility and the vehicle-type filters — see
+                          VisibilityRail. Between them they replaced the
+                          Settings › Visibility tab and the bottom-left type
+                          legend. */}
+                      <VisibilityRail
+                        modifiers={modifiers}
+                        onChangeModifiers={onChangeModifiers}
+                        hiddenVehicleTypes={hiddenVehicleTypes}
+                        onToggleVehicleType={toggleVehicleType}
+                        vehicleCount={vehicles.length}
+                      />
+                      <Zoom />
+                    </div>
+                  </Region>
+                }
+                center={
+                  <Region justify="center" align="start">
+                    <StartHint
+                      running={status.running}
+                      ready={!mapLoading && connected}
+                      onStart={onStartFromHint}
+                    />
+                  </Region>
+                }
+                bottom={
+                  <Dock
+                    navigation={dockNavigation}
+                    status={status}
+                    options={options}
+                    connected={connected}
+                    modeDescriptor={modeDescriptor}
+                    guard={guard}
+                    onStartMode={startMode}
+                    isRecording={recording.isRecording}
+                    onStartRecording={recording.startRecording}
+                    onStopRecording={recording.stopRecording}
+                    replayStatus={replay.replayStatus}
+                    onPauseReplay={replay.pauseReplay}
+                    onResumeReplay={replay.resumeReplay}
+                    onStopReplay={replay.stopReplay}
+                    onSeekReplay={replay.seekReplay}
+                    onSetReplaySpeed={replay.setReplaySpeed}
+                    badges={badges}
+                  />
+                }
               />
               <CreateZoneDialog
                 polygon={geofences.pendingPolygon}
@@ -763,26 +826,101 @@ export default function App() {
               />
             </div>
           </ErrorBoundary>
+
+          {/* Everything that is read or configured rather than pointed at. It
+            takes layout space beside the map instead of floating over it, which
+            is what makes an overlap with anything else structurally impossible
+            (see `shell/Console`). */}
+          <ErrorBoundary fallback={<SectionErrorFallback section="Console" />}>
+            <ConsoleSections
+              navigation={dockNavigation}
+              badges={badges}
+              onSelectTab={onSelectTab}
+              inspector={inspectorTarget}
+              events={{
+                replayStatus: replay.replayStatus,
+                onSeek: replay.seekReplay,
+                onSelectVehicle: onSelectVehicleFromList,
+              }}
+              replayStatus={replay.replayStatus}
+              adapter={adapter}
+              vehicles={vehicles}
+              filter={filters.filter}
+              onFilterChange={onFilterChange}
+              selectedId={filters.selected}
+              onSelectVehicle={onSelectVehicleFromList}
+              onHoverVehicle={onHoverVehicle}
+              onUnhoverVehicle={onUnhoverVehicle}
+              maxSpeed={maxSpeedRef.current}
+              vehicleFleetMap={vehicleFleetMap}
+              fleets={fleets}
+              onCreateFleet={createFleet}
+              onDeleteFleet={deleteFleet}
+              onAssignVehicle={assignVehicle}
+              onUnassignVehicle={unassignVehicle}
+              fleetsError={fleetsError}
+              dispatch={dispatch}
+              jobs={{
+                jobs: jobs.jobs,
+                counts: jobs.counts,
+                // Starting a placement goes through the guard like every other
+                // way into a mode; cancelling and the rest are the draft's own.
+                draft: { ...jobDraft, start: startJobGuarded },
+                onCancelJob: jobs.cancelJob,
+                onDeleteJob: jobs.deleteJob,
+                onAssignJob: jobs.assignJob,
+                vehicles,
+                jobByVehicleId: jobs.jobByVehicleId,
+                error: jobs.error,
+              }}
+              incidents={{
+                incidents: incidents.incidents,
+                createRandom: incidents.createRandom,
+                remove: incidents.remove,
+                error: incidents.error,
+              }}
+              faults={{
+                faults,
+                vehicles,
+                selectedVehicleId: filters.selected,
+              }}
+              geofences={{
+                fences: geofences.fences,
+                onFenceToggle: geofences.onFenceToggle,
+                onFenceDelete: geofences.onFenceDelete,
+                alerts: geofences.alerts,
+                drawingActive: geofences.drawingActive,
+                vertexCount: geofences.drawingVertexCount,
+                onStartDrawing: startGeofenceDrawingGuarded,
+                onCancelDrawing: geofences.onDrawCancel,
+                onConfirmDrawing: geofences.onConfirmDraw,
+              }}
+              analytics={{
+                summary: analytics.summary,
+                fleetHistory: analytics.fleetHistory,
+                summaryHistory: analytics.summaryHistory,
+              }}
+              recordings={{
+                recordings: recording.recordings,
+                replayStatus: replay.replayStatus,
+                onStartReplay: replay.startReplay,
+                onRefreshRecordings: recording.refreshRecordings,
+              }}
+              advanced={{ maxSpeedRef }}
+            />
+          </ErrorBoundary>
         </div>
-        {/* Below the map container, so it takes real layout space instead of
-          covering the canvas or crowding the dock (both of which are absolutely
-          positioned inside that container). */}
-        <SessionTimeline
-          replayStatus={replay.replayStatus}
-          onSeek={replay.seekReplay}
-          onSelectVehicle={onSelectVehicle}
-        />
         {/* Keyboard-first surface over the same entities and dock actions.
-          `setSelectedItem` / `onSelectVehicle` are the very handlers the
-          SearchBar and vehicle list use, so selecting from here flies the
-          camera and opens the Inspector exactly as clicking would. */}
+          These are the very handlers the SearchBar and the fleet list use, so
+          selecting from here flies the camera and opens the console's Inspect
+          view exactly as picking it from a list would. */}
         <CommandPalette
           vehicles={vehicles}
           roads={roads}
           pois={pois}
           actions={paletteActions}
-          onSelectVehicle={onSelectVehicle}
-          onSelectItem={setSelectedItem}
+          onSelectVehicle={onSelectVehicleFromList}
+          onSelectItem={onSelectItemFromList}
         />
         <ContextMenu position={contextMenuXY} onClose={closeContextMenu}>
           <MapContextMenu

@@ -27,17 +27,16 @@ const KEY_CLASS = cn(
  * it is why the cluster exists; the zoom pair rides along for touch and for
  * anyone who prefers a discrete step.
  *
- * Styled as rail keys (34px, `rounded-md`, muted icon) in the same glass box,
- * so bottom-left reads as one instrument rather than two components that happen
- * to be adjacent: the rail says what the map draws, the cluster says where the
- * camera is looking.
+ * Styled as rail keys (34px, `rounded-md`, muted icon) in the same glass box as
+ * the visibility rail directly above it, and stacked the same way — so the left
+ * edge is one 44px column of keys on one left edge, rather than two clusters
+ * that happen to be near each other. The rail says what the map draws; the
+ * cluster says where the camera is looking.
  *
- * Bottom-left, standing on the dock shelf beside the visibility rail (the
- * section panel owns the bottom-right above the dock's right wing). Side by
- * side rather than stacked, so the left column is no taller than the rail and
- * the legend stack's clearance (`--visibility-rail-band`) still holds on a
- * short window. `--spacing-beside-rail` is the rail's inset + width + gap
- * (index.css).
+ * It used to sit *beside* the rail, offset by `left-beside-rail` — a token
+ * holding the rail's own width, so the cluster moved only if someone remembered
+ * to move it. Where the column sits and where it ends are the grid's business
+ * now (see `shell/ShellGrid.tsx`).
  */
 export default function Zoom() {
   const { zoomIn, zoomOut, setBounds } = useMapControls();
@@ -63,7 +62,7 @@ export default function Zoom() {
     <div
       role="group"
       aria-label="Map controls"
-      className="absolute bottom-above-dock left-beside-rail z-10 flex animate-fade-up gap-0.5 rounded-lg border border-border surface-glass glass-frost p-1 shadow-elevated"
+      className="flex animate-fade-up flex-col gap-0.5 rounded-lg border border-border surface-glass glass-frost p-1 shadow-elevated"
     >
       <button
         type="button"
