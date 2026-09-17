@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { z } from "zod";
 import { resolveLandmarkCount } from "../modules/pathfinding/landmarks";
+import { parseFreeFlowFactors } from "../modules/roadnetwork/types";
 import logger from "./logger";
 
 dotenv.config();
@@ -212,6 +213,136 @@ const envObjectSchema = z.object({
    * a malformed value aborts startup rather than silently arming nothing.
    */
   FAULT_PROFILES: z.string().default(""),
+
+  /**
+   * Per-highway-class free-flow factor overrides, `class=factor` comma list
+   * (e.g. `residential=0.5,motorway=0.95`), merged over the defaults in
+   * `modules/roadnetwork/types`. Each factor must be in (0, 1]: an edge's
+   * free-flow speed (routing cost + movement cap) is posted limit × factor.
+   * Resolved here and threaded to the graph builder and pathfinding workers.
+   */
+  FREE_FLOW_FACTORS: z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      try {
+        return parseFreeFlowFactors(v);
+      } catch (err) {
+        ctx.addIssue({ code: "custom", message: (err as Error).message });
+        return z.NEVER;
+      }
+    }),
+
+  /**
+   * Which side of the road traffic drives on: `right` (default) or `left`.
+   * Turn penalties charge the far-side turn (left in right-hand traffic) extra
+   * for crossing oncoming traffic. Threaded to the graph and pathfinding workers.
+   */
+  DRIVE_SIDE: z.enum(["right", "left"]).default("right"),
+
+  // ─── Learned per-edge speed profiles (modules/speedprofiles) ──────
+
+  /**
+   * Learn per-edge speeds by time bucket from observed traversals and price
+   * routes/ETAs with them once a bucket has enough samples. Opt-in (default
+   * false): enabling it changes routing as soon as samples accumulate, and
+   * rebuilds the ALT landmark tables on a learned-speed lower bound.
+   */
+  SPEED_PROFILES_ENABLED: z
+    .enum(["true", "false", "1", "0", ""])
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
+
+  /**
+   * Observation sources, comma list: `sim` (traversals the simulated vehicles
+   * drive) and/or `adapter` (real position fixes posted to
+   * `POST /speed-profiles/observations`, map-matched to edges).
+   */
+  SPEED_PROFILE_SOURCES: z
+    .string()
+    .default("sim")
+    .transform((v, ctx) => {
+      const parts = [
+        ...new Set(
+          v
+            .split(",")
+            .map((p) => p.trim())
+            .filter(Boolean)
+        ),
+      ];
+      const bad = parts.filter((p) => p !== "sim" && p !== "adapter");
+      if (parts.length === 0 || bad.length > 0) {
+        ctx.addIssue({
+          code: "custom",
+          message: `must be a comma list of sim|adapter (got "${v}")`,
+        });
+        return z.NEVER;
+      }
+      return parts as Array<"sim" | "adapter">;
+    }),
+
+  /** Profile period: `week` (hour-of-week buckets) or `day` (weekdays folded together). */
+  SPEED_PROFILE_PERIOD: z.enum(["week", "day"]).default("week"),
+
+  /** Bucket width in hours; must divide the period (168 h for week, 24 h for day). */
+  SPEED_PROFILE_BUCKET_HOURS: z.coerce.number().int().min(1).max(168).default(1),
+
+  /** Samples a bucket needs before its learned speed replaces the static edge cost. */
+  SPEED_PROFILE_MIN_SAMPLES: z.coerce.number().int().min(1).max(65535).default(5),
+
+  /** EWMA weight of a new sample, (0, 1]. */
+  SPEED_PROFILE_EWMA_ALPHA: z.coerce.number().gt(0).max(1).default(0.2),
+
+  /**
+   * Upper clamp on a learned speed as a multiple of the edge's free-flow speed,
+   * [1, 3]. The ALT landmark tables are built on distance / (freeFlow × ratio),
+   * so a larger ratio lets routing learn faster-than-modelled roads at the cost
+   * of a looser heuristic (more nodes expanded per route).
+   */
+  SPEED_PROFILE_MAX_SPEED_RATIO: z.coerce.number().min(1).max(3).default(1),
+
+  /**
+   * Minimum simulated ms between re-publishing the learned table to routing
+   * when new samples arrived. A bucket change always publishes immediately.
+   */
+  SPEED_PROFILE_PUBLISH_INTERVAL_MS: z.coerce.number().int().min(0).default(30_000),
+
+  /** Optional profile JSON file (from `GET /speed-profiles/export`) merged in at startup. */
+  SPEED_PROFILE_SEED_FILE: z.string().default(""),
+
+  // ─── Weather (modules/weather) ─────────────────────────────────────
+
+  /**
+   * Poll Open-Meteo for live weather at the network's location and apply a
+   * global speed factor to routing cost, `estimateTo`, and vehicle movement.
+   * Opt-in (default false): with this off, `WeatherManager` still exists (so
+   * the manual-override API and WS channel work for scenarios/tests) but never
+   * calls `fetch`, and the factor stays 1 (byte-for-byte unchanged routing).
+   */
+  WEATHER_ENABLED: z
+    .enum(["true", "false", "1", "0", ""])
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
+
+  /** How often (ms) to poll Open-Meteo for a new reading. */
+  WEATHER_POLL_INTERVAL_MS: z.coerce.number().int().min(1000).default(600_000),
+
+  /** Timeout (ms) for a single Open-Meteo request; the last value is kept on abort/failure. */
+  WEATHER_FETCH_TIMEOUT_MS: z.coerce.number().int().min(1).default(5000),
+
+  /**
+   * Latitude/longitude to poll. Optional overrides — when unset, `index.ts`
+   * uses the loaded network's bounding-box centre instead (resolved there,
+   * not in this schema, since it depends on the built graph).
+   */
+  WEATHER_LAT: z.preprocess(
+    (v) => (v === "" || v === undefined ? undefined : v),
+    z.coerce.number().min(-90).max(90).optional()
+  ),
+  WEATHER_LON: z.preprocess(
+    (v) => (v === "" || v === undefined ? undefined : v),
+    z.coerce.number().min(-180).max(180).optional()
+  ),
 });
 
 export const envSchema = envObjectSchema
@@ -222,7 +353,15 @@ export const envSchema = envObjectSchema
   .refine((data) => data.WS_TRANSPORT !== "redis" || data.REDIS_URL.length > 0, {
     message: "REDIS_URL is required when WS_TRANSPORT=redis",
     path: ["REDIS_URL"],
-  });
+  })
+  .refine(
+    (data) =>
+      (data.SPEED_PROFILE_PERIOD === "week" ? 168 : 24) % data.SPEED_PROFILE_BUCKET_HOURS === 0,
+    {
+      message: "SPEED_PROFILE_BUCKET_HOURS must divide the period (168 for week, 24 for day)",
+      path: ["SPEED_PROFILE_BUCKET_HOURS"],
+    }
+  );
 
 export type EnvConfig = z.infer<typeof envSchema>;
 
@@ -275,6 +414,22 @@ function buildConfig(env: EnvConfig) {
     faultsEnabled: env.FAULTS_ENABLED,
     faultSeed: env.FAULT_SEED,
     faultProfiles: env.FAULT_PROFILES,
+    freeFlowFactors: env.FREE_FLOW_FACTORS,
+    driveSide: env.DRIVE_SIDE,
+    speedProfilesEnabled: env.SPEED_PROFILES_ENABLED,
+    speedProfileSources: env.SPEED_PROFILE_SOURCES,
+    speedProfilePeriod: env.SPEED_PROFILE_PERIOD,
+    speedProfileBucketHours: env.SPEED_PROFILE_BUCKET_HOURS,
+    speedProfileMinSamples: env.SPEED_PROFILE_MIN_SAMPLES,
+    speedProfileEwmaAlpha: env.SPEED_PROFILE_EWMA_ALPHA,
+    speedProfileMaxSpeedRatio: env.SPEED_PROFILE_MAX_SPEED_RATIO,
+    speedProfilePublishIntervalMs: env.SPEED_PROFILE_PUBLISH_INTERVAL_MS,
+    speedProfileSeedFile: env.SPEED_PROFILE_SEED_FILE,
+    weatherEnabled: env.WEATHER_ENABLED,
+    weatherPollIntervalMs: env.WEATHER_POLL_INTERVAL_MS,
+    weatherFetchTimeoutMs: env.WEATHER_FETCH_TIMEOUT_MS,
+    weatherLat: env.WEATHER_LAT,
+    weatherLon: env.WEATHER_LON,
   } as const;
 }
 

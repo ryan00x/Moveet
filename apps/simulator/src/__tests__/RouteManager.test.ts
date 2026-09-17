@@ -9,6 +9,7 @@ import type { Vehicle, Route, StartOptions } from "../types";
 import path from "path";
 import logger from "../utils/logger";
 import * as metrics from "../metrics";
+import { getProfile } from "../utils/vehicleProfiles";
 
 vi.mock("../utils/logger", () => ({
   default: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
@@ -142,6 +143,19 @@ describe("RouteManager", () => {
       expect(vehicle.speed).toBeLessThanOrEqual(vehicle.currentEdge.maxSpeed);
     });
 
+    it("caps movement at the edge's free-flow speed so it matches the routing cost", () => {
+      const vehicle = firstVehicle();
+      vehicle.currentEdge = { ...vehicle.currentEdge, maxSpeed: 50, freeFlowSpeed: 25 };
+      vehicle.speed = 200;
+      vehicle.targetSpeed = 200;
+      traffic.leave(vehicle.currentEdge.id);
+      traffic.leave(vehicle.currentEdge.id);
+
+      routeManager.updateSpeed(vehicle, 1000, { ...DEFAULT_OPTIONS, minSpeed: 1 });
+
+      expect(vehicle.speed).toBeLessThanOrEqual(25);
+    });
+
     it("should respect minSpeed as lower bound", () => {
       const vehicle = firstVehicle();
       vehicle.speed = 1;
@@ -158,6 +172,34 @@ describe("RouteManager", () => {
       });
 
       expect(vehicle.speed).toBeGreaterThanOrEqual(15);
+    });
+
+    it("applies the weather factor as an extra cap so movement matches the routing ETA (fleetsim-all-1ajn.5)", () => {
+      const vehicle = firstVehicle();
+      vehicle.currentEdge = { ...vehicle.currentEdge, maxSpeed: 50, freeFlowSpeed: 40 };
+      vehicle.speed = 200;
+      vehicle.targetSpeed = 200;
+      traffic.leave(vehicle.currentEdge.id);
+      traffic.leave(vehicle.currentEdge.id);
+      vi.spyOn(network, "getWeatherFactor").mockReturnValue(0.5);
+
+      routeManager.updateSpeed(vehicle, 1000, { ...DEFAULT_OPTIONS, minSpeed: 1 });
+
+      expect(vehicle.speed).toBeLessThanOrEqual(20); // 40 x 0.5
+    });
+
+    it("leaves movement unaffected when the weather factor is 1 (no effect / disabled)", () => {
+      const vehicle = firstVehicle();
+      vehicle.currentEdge = { ...vehicle.currentEdge, maxSpeed: 50, freeFlowSpeed: 25 };
+      vehicle.speed = 200;
+      vehicle.targetSpeed = 200;
+      traffic.leave(vehicle.currentEdge.id);
+      traffic.leave(vehicle.currentEdge.id);
+      vi.spyOn(network, "getWeatherFactor").mockReturnValue(1);
+
+      routeManager.updateSpeed(vehicle, 1000, { ...DEFAULT_OPTIONS, minSpeed: 1 });
+
+      expect(vehicle.speed).toBeLessThanOrEqual(25);
     });
   });
 
@@ -263,6 +305,202 @@ describe("RouteManager", () => {
       }
 
       routeManager.off("direction", directionListener);
+    });
+  });
+
+  describe("estimateTo", () => {
+    it("prices each edge at min(profile max, edge free-flow speed), like movement", async () => {
+      const vehicle = firstVehicle();
+      const base = vehicle.currentEdge;
+      // Explicitly zero nodeDelayH: `base` is a real fixture edge, which may
+      // carry a precomputed node-control delay that would otherwise leak
+      // through the spread and pollute this speed/distance-only assertion.
+      const slow = { ...base, distance: 1, maxSpeed: 50, freeFlowSpeed: 30, nodeDelayH: undefined };
+      const fast = {
+        ...base,
+        distance: 2,
+        maxSpeed: 110,
+        freeFlowSpeed: 99,
+        nodeDelayH: undefined,
+      };
+      vi.spyOn(network, "findRouteAsync").mockResolvedValue({ edges: [slow, fast], distance: 3 });
+
+      const est = await routeManager.estimateTo(vehicle.id, [45.5029, -73.5661]);
+
+      const profileMax = getProfile(vehicle.type).maxSpeed;
+      const expected = (1 / Math.min(30, profileMax) + 2 / Math.min(99, profileMax)) * 3600;
+      expect(est).not.toBeNull();
+      expect(est!.etaSeconds).toBeCloseTo(expected, 6);
+      expect(est!.distanceKm).toBe(3);
+    });
+
+    it("adds each edge's precomputed node-control delay on top of travel time", async () => {
+      const vehicle = firstVehicle();
+      const base = vehicle.currentEdge;
+      // One plain edge (nodeDelayH explicitly zeroed — `base` is a real fixture
+      // edge and may carry one of its own), one ending at a signalized/stopped node.
+      const plain = {
+        ...base,
+        distance: 1,
+        maxSpeed: 50,
+        freeFlowSpeed: 30,
+        nodeDelayH: undefined,
+      };
+      const controlled = {
+        ...base,
+        distance: 1,
+        maxSpeed: 50,
+        freeFlowSpeed: 30,
+        nodeDelayH: 25 / 3600,
+      };
+      vi.spyOn(network, "findRouteAsync").mockResolvedValue({
+        edges: [plain, controlled],
+        distance: 2,
+      });
+
+      const est = await routeManager.estimateTo(vehicle.id, [45.5029, -73.5661]);
+
+      const profileMax = getProfile(vehicle.type).maxSpeed;
+      const travelHours = (1 / Math.min(30, profileMax)) * 2;
+      const expectedSeconds = (travelHours + 25 / 3600) * 3600;
+      expect(est).not.toBeNull();
+      expect(est!.etaSeconds).toBeCloseTo(expectedSeconds, 6);
+    });
+
+    it("prices an edge with a learned speed at that speed instead of free-flow", async () => {
+      const vehicle = firstVehicle();
+      const base = vehicle.currentEdge;
+      const learned = {
+        ...base,
+        distance: 1,
+        maxSpeed: 50,
+        freeFlowSpeed: 30,
+        nodeDelayH: undefined,
+      };
+      const plain = { ...learned };
+      vi.spyOn(network, "findRouteAsync").mockResolvedValue({
+        edges: [learned, plain],
+        distance: 2,
+      });
+      vi.spyOn(network, "turnCostHours").mockReturnValue(0);
+      vi.spyOn(network, "learnedSpeedKmh").mockImplementation((e) =>
+        e === learned ? 12 : undefined
+      );
+
+      const est = await routeManager.estimateTo(vehicle.id, [45.5029, -73.5661]);
+
+      const profileMax = getProfile(vehicle.type).maxSpeed;
+      const expected = (1 / Math.min(12, profileMax) + 1 / Math.min(30, profileMax)) * 3600;
+      expect(est!.etaSeconds).toBeCloseTo(expected, 6);
+    });
+
+    it("adds the turn cost the route search charges between consecutive edges", async () => {
+      const vehicle = firstVehicle();
+      const base = vehicle.currentEdge;
+      const edge = { ...base, distance: 1, maxSpeed: 50, freeFlowSpeed: 30, nodeDelayH: undefined };
+      const route = [edge, { ...edge }, { ...edge }];
+      vi.spyOn(network, "findRouteAsync").mockResolvedValue({ edges: route, distance: 3 });
+      const turnSpy = vi.spyOn(network, "turnCostHours").mockReturnValue(7 / 3600);
+
+      const est = await routeManager.estimateTo(vehicle.id, [45.5029, -73.5661]);
+
+      const profileMax = getProfile(vehicle.type).maxSpeed;
+      const expectedSeconds = (3 / Math.min(30, profileMax)) * 3600 + 2 * 7;
+      expect(turnSpy).toHaveBeenCalledTimes(2);
+      expect(turnSpy).toHaveBeenCalledWith(route[0], route[1]);
+      expect(est!.etaSeconds).toBeCloseTo(expectedSeconds, 6);
+    });
+
+    it("applies the current weather factor to edge speed, like routing cost (fleetsim-all-1ajn.5)", async () => {
+      const vehicle = firstVehicle();
+      const base = vehicle.currentEdge;
+      const edge = { ...base, distance: 1, maxSpeed: 50, freeFlowSpeed: 30, nodeDelayH: undefined };
+      vi.spyOn(network, "findRouteAsync").mockResolvedValue({ edges: [edge], distance: 1 });
+      vi.spyOn(network, "getWeatherFactor").mockReturnValue(0.5);
+
+      const est = await routeManager.estimateTo(vehicle.id, [45.5029, -73.5661]);
+
+      const profileMax = getProfile(vehicle.type).maxSpeed;
+      // Dividing travel time by the weather factor is equivalent to
+      // multiplying speed by it — matches applyDynamicCost in pathfinding/cost.ts.
+      const expected = (1 / (Math.min(30, profileMax) * 0.5)) * 3600;
+      expect(est!.etaSeconds).toBeCloseTo(expected, 6);
+    });
+
+    it("does NOT scale node delay by the weather factor", async () => {
+      const vehicle = firstVehicle();
+      const base = vehicle.currentEdge;
+      const edge = { ...base, distance: 1, maxSpeed: 50, freeFlowSpeed: 30, nodeDelayH: 25 / 3600 };
+      vi.spyOn(network, "findRouteAsync").mockResolvedValue({ edges: [edge], distance: 1 });
+      vi.spyOn(network, "getWeatherFactor").mockReturnValue(0.5);
+
+      const est = await routeManager.estimateTo(vehicle.id, [45.5029, -73.5661]);
+
+      const profileMax = getProfile(vehicle.type).maxSpeed;
+      const expected = (1 / (Math.min(30, profileMax) * 0.5) + 25 / 3600) * 3600;
+      expect(est!.etaSeconds).toBeCloseTo(expected, 6);
+    });
+  });
+
+  // ─── Arrival edge (turn rules at a moving vehicle's next node) ─────
+
+  describe("arrival edge", () => {
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it("setRandomDestination routes from currentEdge.end with currentEdge as the arrival", async () => {
+      const vehicle = firstVehicle();
+      const spy = vi.spyOn(network, "findRouteAsync").mockResolvedValue(null);
+      routeManager.setRandomDestination(vehicle.id);
+      await flush();
+      expect(spy.mock.calls[0][0]).toBe(vehicle.currentEdge.end);
+      expect(spy.mock.calls[0][3]).toBe(vehicle.currentEdge);
+    });
+
+    it("falls back to an unconstrained search when the arrival leaves no legal route", async () => {
+      const vehicle = firstVehicle();
+      const route: Route = { edges: [vehicle.currentEdge], distance: 1 };
+      const spy = vi
+        .spyOn(network, "findRouteAsync")
+        .mockImplementation(async (_s, _e, _r, arrival) => (arrival ? null : route));
+      routeManager.setRandomDestination(vehicle.id);
+      await flush();
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy.mock.calls[1][3]).toBeUndefined();
+      expect(routeManager.getRoute(vehicle.id)).toBe(route);
+    });
+
+    it("an incident reroute passes currentEdge as the arrival", async () => {
+      const vehicle = firstVehicle();
+      routeManager.setRoute(vehicle.id, { edges: [vehicle.currentEdge], distance: 1 });
+      const spy = vi.spyOn(network, "findRouteAsync").mockResolvedValue(null);
+      (routeManager as any).dispatchReroute(vehicle.id, "inc-1");
+      await flush();
+      expect(spy.mock.calls[0][0]).toBe(vehicle.currentEdge.end);
+      expect(spy.mock.calls[0][3]).toBe(vehicle.currentEdge);
+    });
+
+    it("estimateTo charges the first turn off currentEdge when starting at its end node", async () => {
+      const vehicle = firstVehicle();
+      vehicle.position = [...vehicle.currentEdge.end.coordinates] as [number, number];
+      const edge = {
+        ...vehicle.currentEdge,
+        distance: 1,
+        maxSpeed: 50,
+        freeFlowSpeed: 30,
+        nodeDelayH: undefined,
+      };
+      const spy = vi.spyOn(network, "findRouteAsync").mockResolvedValue({
+        edges: [edge],
+        distance: 1,
+      });
+      const turnSpy = vi.spyOn(network, "turnCostHours").mockReturnValue(9 / 3600);
+
+      const est = await routeManager.estimateTo(vehicle.id, [45.5029, -73.5661]);
+
+      expect(spy.mock.calls[0][3]).toBe(vehicle.currentEdge);
+      expect(turnSpy).toHaveBeenCalledWith(vehicle.currentEdge, edge);
+      const profileMax = getProfile(vehicle.type).maxSpeed;
+      expect(est!.etaSeconds).toBeCloseTo((1 / Math.min(30, profileMax)) * 3600 + 9, 6);
     });
   });
 

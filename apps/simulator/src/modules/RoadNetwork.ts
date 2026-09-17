@@ -1,6 +1,6 @@
 import fs from "fs";
 import type { FeatureCollection } from "geojson";
-import type { Node, Edge, Route, HeatZoneFeature, POI, BoundingBox } from "../types";
+import type { Node, Edge, Route, HeatZoneFeature, POI, BoundingBox, HighwayType } from "../types";
 import { HEAT_ZONE_DEFAULTS } from "../constants";
 import { config } from "../utils/config";
 import type { TrafficProfile } from "../utils/trafficProfiles";
@@ -11,6 +11,8 @@ import { GraphBuilder, type SpeedLimitSign } from "./roadnetwork/GraphBuilder";
 import { SpatialIndex } from "./roadnetwork/SpatialIndex";
 import { PathfindingEngine } from "./roadnetwork/PathfindingEngine";
 import type { Road } from "./roadnetwork/types";
+import type { DriveSide } from "./pathfinding/turns";
+import type { SpeedOverrideTable } from "./speedprofiles/SpeedProfileStore";
 import EventEmitter from "events";
 
 /** Construction-time knobs for {@link RoadNetwork}. */
@@ -25,6 +27,22 @@ export interface RoadNetworkOptions {
    * (the parsed, clamped `PATHFINDING_LANDMARKS`).
    */
   landmarkCount?: number;
+  /**
+   * Per-highway-class free-flow factors. Defaults to `config.freeFlowFactors`
+   * (the parsed `FREE_FLOW_FACTORS`); threaded to the pool workers too.
+   */
+  freeFlowFactors?: Record<HighwayType, number>;
+  /**
+   * Drive side for turn penalties. Defaults to `config.driveSide` (the parsed
+   * `DRIVE_SIDE`); threaded to the pool workers too.
+   */
+  driveSide?: DriveSide;
+  /**
+   * `SPEED_PROFILE_MAX_SPEED_RATIO` when learned speed profiles are enabled, or
+   * null when they are disabled. Defaults to the parsed config
+   * (`SPEED_PROFILES_ENABLED`); threaded to the pool workers too.
+   */
+  speedProfileRatio?: number | null;
 }
 
 /**
@@ -32,13 +50,13 @@ export interface RoadNetworkOptions {
  * review #6):
  *
  *  - {@link GraphBuilder}      builds the graph (nodes/edges/roads/connected
- *                              edges/base costs/turn restrictions/ALT landmark
+ *                              edges/base costs/turn bans/ALT landmark
  *                              tables) and eagerly derives the POI /
  *                              speed-limit / LineString-only collections from
  *                              the raw GeoJSON.
  *  - {@link SpatialIndex}      grid + sector indexes, nearest-node and random
  *                              node/edge/POI-node queries, bbox.
- *  - {@link PathfindingEngine} main-thread A*, incident costs and the LRU
+ *  - {@link PathfindingEngine} main-thread A*, incident + turn costs and the LRU
  *                              route cache, plus connected/fallback-edge lookups.
  *  - {@link PathfindingPool}   worker-thread A* pool (lazy-initialized).
  *
@@ -60,8 +78,6 @@ export class RoadNetwork extends EventEmitter {
 
   private spatial: SpatialIndex;
   private pathfinding: PathfindingEngine;
-  private turnRestrictions: Map<string, Set<string>>;
-  private turnRestrictionTypes: Map<string, "prohibitory" | "mandatory">;
 
   // Eagerly-derived, data-backed collections (the raw FeatureCollection is
   // released after build, so these are the source of truth at runtime).
@@ -81,24 +97,48 @@ export class RoadNetwork extends EventEmitter {
    * cannot import the config module.
    */
   private landmarkCount: number;
+  private freeFlowFactors: Record<HighwayType, number>;
+  private driveSide: DriveSide;
+  private speedProfileRatio: number | null;
+  /** Last applied learned-speed table, replayed to the pool when it starts. */
+  private speedOverrides: SpeedOverrideTable | null = null;
+  /**
+   * Last set global weather speed factor (fleetsim-all-1ajn.5), replayed to the
+   * pool when it lazily starts — same reason `speedOverrides` is: weather may
+   * already be non-default by the time the first async route request creates
+   * the pool.
+   */
+  private weatherFactor = 1;
+  /** Called before every route request so a profile can follow the sim clock. */
+  private routeRequestHook: (() => void) | null = null;
 
   constructor(geojsonPath: string, options?: RoadNetworkOptions) {
     super();
     this.geojsonPath = geojsonPath;
     this.landmarkCount = options?.landmarkCount ?? config.pathfindingLandmarks;
+    this.freeFlowFactors = options?.freeFlowFactors ?? config.freeFlowFactors;
+    this.driveSide = options?.driveSide ?? config.driveSide;
+    this.speedProfileRatio =
+      options?.speedProfileRatio !== undefined
+        ? options.speedProfileRatio
+        : config.speedProfilesEnabled
+          ? config.speedProfileMaxSpeedRatio
+          : null;
 
     // Parse the raw GeoJSON into a local — NOT a field — so the only reference
     // is dropped when the constructor returns and the blob can be GC'd.
     const data = JSON.parse(fs.readFileSync(geojsonPath, "utf8")) as FeatureCollection;
 
-    const built = new GraphBuilder({ landmarkCount: this.landmarkCount }).build(data);
+    const built = new GraphBuilder({
+      landmarkCount: this.landmarkCount,
+      freeFlowFactors: this.freeFlowFactors,
+      speedProfileRatio: this.speedProfileRatio,
+    }).build(data);
     // `data` is now unreferenced from here on; it is released for GC.
 
     this.nodes = built.nodes;
     this.edges = built.edges;
     this.roads = built.roads;
-    this.turnRestrictions = built.turnRestrictions;
-    this.turnRestrictionTypes = built.turnRestrictionTypes;
     this.pois = built.pois;
     this.speedLimits = built.speedLimits;
     this.lineStringFeatures = built.lineStringFeatures;
@@ -110,10 +150,11 @@ export class RoadNetwork extends EventEmitter {
         edges: this.edges,
         edgeBaseCost: built.edgeBaseCost,
         connectedEdges: built.connectedEdges,
-        turnRestrictions: built.turnRestrictions,
-        turnRestrictionTypes: built.turnRestrictionTypes,
+        turnBans: built.turnBans,
+        driveSide: this.driveSide,
         maxNetworkSpeed: built.maxNetworkSpeed,
         landmarks: built.landmarks,
+        speedProfileRatio: this.speedProfileRatio,
       },
       options
     );
@@ -239,14 +280,79 @@ export class RoadNetwork extends EventEmitter {
   /**
    * Finds the shortest route between two nodes using A* pathfinding.
    * Returns null if no route exists between the nodes.
+   *
+   * @param arrival  Edge a moving vehicle reaches `start` on; its turn bans,
+   *   U-turn rule and turn cost then apply to the first turn (see
+   *   `PathfindingEngine.findRoute`).
    */
-  public findRoute(start: Node, end: Node): Route | null {
-    return this.pathfinding.findRoute(start, end);
+  public findRoute(start: Node, end: Node, arrival?: Edge | null): Route | null {
+    this.routeRequestHook?.();
+    return this.pathfinding.findRoute(start, end, arrival);
   }
 
-  /** Expose turn restrictions for testing. Returns a shallow copy of the map. */
-  public getTurnRestrictions(): Map<string, Set<string>> {
-    return new Map(this.turnRestrictions);
+  /**
+   * OSM turn restrictions resolved to edge level: arriving edge id -> ids of
+   * the edges that may not follow it. Returns a shallow copy of the map.
+   */
+  public getTurnBans(): Map<string, Set<string>> {
+    return new Map(this.pathfinding.bans);
+  }
+
+  /**
+   * Turn cost (hours) for driving from `from` onto the consecutive edge `to`,
+   * exactly as the route search charges it. Used to price route ETAs.
+   */
+  public turnCostHours(from: Edge, to: Edge): number {
+    return this.pathfinding.turnCostHours(from, to);
+  }
+
+  // ─── Learned speed profiles (fleetsim-all-1ajn.4) ───────────────────
+
+  /** Number of graph edges; the range of {@link edgeIndexOf}. */
+  public get edgeCount(): number {
+    return this.pathfinding.edgeCount;
+  }
+
+  /** Dense index of a graph edge (shared with the pool workers), or -1. */
+  public edgeIndexOf(edge: Edge): number {
+    return this.pathfinding.edgeIndexOf(edge);
+  }
+
+  public edgeAt(index: number): Edge | undefined {
+    return this.pathfinding.edgeAt(index);
+  }
+
+  /** Whether learned speed profiles are enabled for this graph. */
+  public get speedProfilesEnabled(): boolean {
+    return this.speedProfileRatio !== null;
+  }
+
+  /**
+   * Replaces the learned-speed table on the main thread and in every pool
+   * worker. Messages to a worker are delivered in order, so every route request
+   * posted after this call is searched with the new table; the version bump
+   * keys the route cache so no route priced under an older table is served.
+   * Returns false when speed profiles are disabled.
+   */
+  public setSpeedOverrides(table: SpeedOverrideTable): boolean {
+    if (!this.pathfinding.setSpeedOverrides(table)) return false;
+    this.speedOverrides = table;
+    this.pathfindingPool?.setSpeedOverrides(table);
+    return true;
+  }
+
+  /** The (clamped) learned speed routing currently uses for `edge`, if any. */
+  public learnedSpeedKmh(edge: Edge): number | undefined {
+    return this.pathfinding.learnedSpeedKmh(edge);
+  }
+
+  public get speedProfileVersion(): number {
+    return this.pathfinding.speedProfileVersion;
+  }
+
+  /** Installs (or clears) the hook run at the start of every route request. */
+  public setRouteRequestHook(hook: (() => void) | null): void {
+    this.routeRequestHook = hook;
   }
 
   /** Clear all cached routes. */
@@ -262,6 +368,25 @@ export class RoadNetwork extends EventEmitter {
   /** Clear all incident edge data. Cache invalidation is handled by the fingerprint key. */
   public clearIncidentEdges(): void {
     this.pathfinding.clearIncidentEdges();
+  }
+
+  /**
+   * Sets the global weather speed factor (clamped to `(0, 1]`) on the
+   * main-thread engine and every pool worker, and remembers it so a
+   * lazily-created pool starts in sync. Read by routing cost
+   * ({@link findRoute}/{@link findRouteAsync}), {@link RouteManager.estimateTo}
+   * and {@link RouteManager.updateSpeed} via {@link getWeatherFactor}, so ETAs
+   * and simulated movement stay consistent with each other.
+   */
+  public setWeatherFactor(factor: number): void {
+    this.pathfinding.setWeatherFactor(factor);
+    this.weatherFactor = this.pathfinding.getWeatherFactor();
+    this.pathfindingPool?.setWeatherFactor(this.weatherFactor);
+  }
+
+  /** Current global weather speed factor (1 = no effect / disabled). */
+  public getWeatherFactor(): number {
+    return this.pathfinding.getWeatherFactor();
   }
 
   /** Return hit/miss statistics for the route cache. */
@@ -293,12 +418,16 @@ export class RoadNetwork extends EventEmitter {
   public async findRouteAsync(
     start: Node,
     end: Node,
-    restrictedHighways?: string[]
+    restrictedHighways?: string[],
+    arrival?: Edge | null
   ): Promise<Route | null> {
+    this.routeRequestHook?.();
+    const from = this.pathfinding.validArrival(start, arrival);
     // Check cache first — keyed identically to the sync path, plus the
-    // restricted-highway profile (a different profile yields a different route).
+    // restricted-highway profile (a different profile yields a different route)
+    // and the arrival edge (it changes which first turns are legal / cost).
     const highwayKey = restrictedHighways?.length ? restrictedHighways.join(",") : "";
-    const cacheKey = `${start.id}|${end.id}|${this.pathfinding.incidentFingerprint()}|${highwayKey}`;
+    const cacheKey = `${start.id}|${end.id}|${this.pathfinding.costFingerprint()}|${highwayKey}${PathfindingEngine.arrivalKey(from)}`;
     const cached = this.pathfinding.getCachedRoute(cacheKey);
     if (cached) return cached;
 
@@ -306,26 +435,23 @@ export class RoadNetwork extends EventEmitter {
     if (!this.pathfindingPool) {
       this.pathfindingPool = new PathfindingPool(this.geojsonPath, {
         landmarkCount: this.landmarkCount,
+        freeFlowFactors: this.freeFlowFactors,
+        driveSide: this.driveSide,
+        speedProfileRatio: this.speedProfileRatio,
       });
+      if (this.speedOverrides) this.pathfindingPool.setSpeedOverrides(this.speedOverrides);
+      if (this.weatherFactor !== 1) this.pathfindingPool.setWeatherFactor(this.weatherFactor);
     }
 
+    // Turn restrictions are NOT sent per request: each worker resolves them
+    // from the same GeoJSON at build time.
     const incidentEdges = this.pathfinding.incidents;
-    const restrictions =
-      this.turnRestrictions.size > 0
-        ? Object.fromEntries([...this.turnRestrictions.entries()].map(([k, v]) => [k, [...v]]))
-        : undefined;
-    const restrictionTypes =
-      this.turnRestrictions.size > 0
-        ? Object.fromEntries(this.turnRestrictionTypes.entries())
-        : undefined;
-
     const result = await this.pathfindingPool.findRoute(
       start.id,
       end.id,
       incidentEdges.size > 0 ? incidentEdges : undefined,
       restrictedHighways,
-      restrictions,
-      restrictionTypes
+      from ? { edgeId: from.id, startId: from.start.id } : undefined
     );
     if (!result) return null;
 

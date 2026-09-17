@@ -23,6 +23,18 @@ export interface VehicleDTO {
   heading: number;
   fleetId?: string;
   /**
+   * Seconds until the vehicle reaches the end of its active route, as of this
+   * sample. Absent when it has no route.
+   *
+   * Priced by the routing cost model (learned or free-flow edge speeds capped
+   * by the vehicle profile, node control delays, turn manoeuvres, weather), NOT
+   * by `distance / speed`. It therefore does not swing with the vehicle's
+   * instantaneous speed: a turn slowdown costs the seconds it actually costs on
+   * the edge it happens on. The route-wide figure and its composition arrive
+   * once per route on the `direction` channel; this is the live remainder.
+   */
+  etaSeconds?: number;
+  /**
    * Device fix timestamp (epoch ms), as reported by the simulated device.
    * Present only for a vehicle whose device has a fault profile — a skewed
    * device clock is only observable if the sample carries its own timestamp.
@@ -244,6 +256,12 @@ export interface Node {
   coordinates: Position;
   connections: Edge[];
   trafficSignal?: boolean; // true when OSM highway=traffic_signals node
+  /**
+   * Distinct neighbouring nodes (via inbound or outbound edges), stamped at
+   * graph build: 1 = dead end, 2 = a bend/continuation, >= 3 = intersection.
+   * Drives the turn model (`pathfinding/turns.ts`).
+   */
+  degree?: number;
 }
 
 export interface Edge {
@@ -255,12 +273,26 @@ export interface Edge {
   distance: number;
   bearing: number;
   highway: HighwayType;
-  maxSpeed: number;
+  maxSpeed: number; // posted limit (km/h), incl. the roundabout reduction
+  /**
+   * Typical uncongested travel speed (km/h): `maxSpeed` × the highway class's
+   * free-flow factor. Used by routing cost and as the vehicle movement cap;
+   * consumers fall back to `maxSpeed` when absent.
+   */
+  freeFlowSpeed?: number;
   surface: string;
   oneway: boolean;
   lanes?: number; // OSM lanes count (default 1)
   capacity?: number; // lanes × 1800 veh/hour (HCM standard)
   smoothnessFactor?: number; // 0.3–1.0 speed multiplier from OSM smoothness tag
+  /**
+   * Precomputed expected-value delay (hours) for arriving at `end` via this
+   * edge — traffic signal / stop / give-way / crossing / level crossing /
+   * point traffic-calming. Additive, non-negative, and applied on top of the
+   * edge's base travel time (see `pathfinding/cost.ts` `applyDynamicCost`).
+   * Undefined means no control on `end` (equivalent to 0).
+   */
+  nodeDelayH?: number;
 }
 
 export interface Route {
@@ -315,6 +347,26 @@ export interface IncidentDTO {
   expiresAt: number;
   autoClears: boolean;
   position: Position;
+}
+
+// ─── Weather (fleetsim-all-1ajn.5) ───────────────────────────────────
+
+/**
+ * Dominant weather condition driving the global routing/movement speed
+ * factor. `wind` is reported only when no precipitation/fog condition applies
+ * but wind alone is strong enough to matter (see `modules/weather/conditions`
+ * in the simulator).
+ */
+export type WeatherCondition = "clear" | "light_rain" | "rain" | "snow" | "ice" | "fog" | "wind";
+
+export interface WeatherDTO {
+  condition: WeatherCondition;
+  /** Global routing/movement speed multiplier, `(0, 1]`; 1 = no effect. */
+  speedFactor: number;
+  /** "override": set via `POST /weather`. "live": from the Open-Meteo poll (or the default, clear/1, before the first poll / when disabled). */
+  source: "live" | "override";
+  /** Epoch ms of the underlying live reading, or null before the first poll. Unaffected by an override. */
+  observedAt: number | null;
 }
 
 // ─── Analytics ────────────────────────────────────────────────────

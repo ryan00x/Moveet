@@ -9,6 +9,7 @@ import type {
   MultiStopRoute,
   Incident,
   StartOptions,
+  VehicleEtaUpdate,
 } from "../types";
 import type { RoadNetwork } from "./RoadNetwork";
 import type { VehicleRegistry } from "./VehicleRegistry";
@@ -21,6 +22,14 @@ import logger from "../utils/logger";
 import { setUnroutedVehicles } from "../metrics";
 import { config } from "../utils/config";
 import { HEAT_ZONE_DEFAULTS } from "../constants";
+import type { TraversalRecorder } from "./speedprofiles/TraversalRecorder";
+import {
+  priceRoute,
+  remainingDistanceKm,
+  remainingEtaSeconds,
+  type EtaBreakdown,
+  type RoutePricing,
+} from "./eta";
 
 /**
  * After the first "vehicle still unrouted" warning is logged for a vehicle,
@@ -95,6 +104,19 @@ export class RouteManager extends EventEmitter {
    */
   private serializedRouteCache: Map<string, Route> = new Map();
 
+  /**
+   * Per-vehicle route pricing (see `modules/eta.ts`), computed once at
+   * {@link setRouteFor} and read by every ETA consumer: the `direction` event,
+   * the per-tick live ETA on the wire, and `getDirections`.
+   *
+   * Cached rather than recomputed because a live ETA is read once per vehicle
+   * per tick, and repricing a long route on every tick would be O(edges) work
+   * in the hot path for a number that only changes when the route or the
+   * network's state does. `arrivalEdge` is kept so a reprice (weather moved)
+   * charges the same first turn the original pricing did.
+   */
+  private routePricing: Map<string, { pricing: RoutePricing; arrivalEdge?: Edge }> = new Map();
+
   // ─── Incident reroute staggering ──────────────────────────────────
   // A single incident can overlap every vehicle on an edge. Dispatching a
   // pathfind for all of them at once floods the bounded worker-pool queue and
@@ -119,6 +141,13 @@ export class RouteManager extends EventEmitter {
    */
   private now: () => number = Date.now;
 
+  /**
+   * Learned-speed-profile `sim` source (see `speedprofiles/TraversalRecorder`),
+   * or null when that source is off — the movement hot path then pays one null
+   * check per edge transition.
+   */
+  private traversals: TraversalRecorder | null = null;
+
   constructor(
     private network: RoadNetwork,
     private registry: VehicleRegistry,
@@ -130,6 +159,11 @@ export class RouteManager extends EventEmitter {
   /** Replaces the dwell clock. See {@link now}. */
   setTimeSource(now: () => number): void {
     this.now = now;
+  }
+
+  /** Installs (or removes) the traversal recorder that feeds learned speed profiles. */
+  setTraversalRecorder(recorder: TraversalRecorder | null): void {
+    this.traversals = recorder;
   }
 
   // ─── Route getters ────────────────────────────────────────────────
@@ -145,15 +179,114 @@ export class RouteManager extends EventEmitter {
   deleteRoute(vehicleId: string): void {
     this.routes.delete(vehicleId);
     this.serializedRouteCache.delete(vehicleId);
+    this.routePricing.delete(vehicleId);
   }
 
   /**
    * Single chokepoint for assigning a vehicle's active route. Invalidates the
    * vehicle's serialized-route cache so the next read re-serializes.
    */
-  private setRouteFor(vehicleId: string, route: Route): void {
+  private setRouteFor(vehicleId: string, route: Route, arrivalEdge?: Edge): void {
     this.routes.set(vehicleId, route);
     this.serializedRouteCache.delete(vehicleId);
+    this.routePricing.set(vehicleId, {
+      pricing: this.price(vehicleId, route, arrivalEdge),
+      arrivalEdge,
+    });
+  }
+
+  /**
+   * Prices a route with the vehicle's profile cap and the network's current
+   * learned speeds, turn costs and weather factor. See `modules/eta.ts`.
+   */
+  private price(vehicleId: string, route: Route, arrivalEdge?: Edge): RoutePricing {
+    const vehicle = this.registry.get(vehicleId);
+    const profile = getProfile(vehicle?.type ?? "car");
+    return priceRoute(
+      route.edges,
+      {
+        learnedSpeedKmh: (edge) => this.network.learnedSpeedKmh(edge),
+        turnCostHours: (from, to) => this.network.turnCostHours(from, to),
+        weatherFactor: this.network.getWeatherFactor(),
+        profileMaxSpeed: profile.maxSpeed,
+      },
+      arrivalEdge
+    );
+  }
+
+  /**
+   * The vehicle's cached route pricing, repriced if the weather factor has
+   * moved since it was computed.
+   *
+   * Weather is the only pricing input that changes under a route that is
+   * already assigned (a learned-profile refresh flushes the route cache and
+   * reroutes follow; incidents reroute outright). Repricing is O(edges) but
+   * only runs on the poll boundary that actually moved the factor, not per
+   * tick.
+   */
+  private pricingFor(vehicleId: string): RoutePricing | undefined {
+    const entry = this.routePricing.get(vehicleId);
+    if (!entry) return undefined;
+    const factor = this.network.getWeatherFactor();
+    if (entry.pricing.pricedAtWeatherFactor !== factor) {
+      const route = this.routes.get(vehicleId);
+      if (!route) return entry.pricing;
+      entry.pricing = this.price(vehicleId, route, entry.arrivalEdge);
+    }
+    return entry.pricing;
+  }
+
+  /**
+   * Seconds until the vehicle reaches the end of its active route, from where
+   * it is on that route right now. `undefined` when it has no route or has not
+   * been placed on one yet — a gap the UI renders as "no ETA", never a
+   * fabricated number.
+   *
+   * This is what goes on the wire every tick ({@link VehicleDTO.etaSeconds}).
+   * It falls monotonically as the vehicle drives, and is independent of
+   * `vehicle.speed`: a turn slowdown costs the seconds it actually costs on
+   * the edge it happens on, instead of rescaling the whole remaining route.
+   */
+  etaSecondsFor(vehicle: Vehicle): number | undefined {
+    const pricing = this.pricingFor(vehicle.id);
+    if (!pricing) return undefined;
+    const edgeIndex = this.routeEdgeIndex(vehicle);
+    // Assigned but not yet ON the route: a route set from the end of the
+    // current edge only reaches `edges[0]` at the next edge transition, which
+    // can be a minute away on a long edge. The honest answer for that window is
+    // the whole route — the trip has not started, not "no ETA".
+    if (edgeIndex < 0) return pricing.totalSeconds;
+    return remainingEtaSeconds(pricing, edgeIndex, vehicle.progress ?? 0);
+  }
+
+  /** Kilometres left on the active route, or `undefined`. See {@link etaSecondsFor}. */
+  remainingKmFor(vehicle: Vehicle): number | undefined {
+    const pricing = this.pricingFor(vehicle.id);
+    if (!pricing) return undefined;
+    const edgeIndex = this.routeEdgeIndex(vehicle);
+    if (edgeIndex < 0) return pricing.suffixKm[0];
+    return remainingDistanceKm(pricing, edgeIndex, vehicle.progress ?? 0);
+  }
+
+  /** Where a vehicle's ETA seconds go, for the active route. */
+  etaBreakdownFor(vehicleId: string): EtaBreakdown | undefined {
+    return this.pricingFor(vehicleId)?.breakdown;
+  }
+
+  /**
+   * The vehicle's index into its route's edges, or -1 when it is not on the
+   * route yet. `vehicle.edgeIndex` is -1 in the window between a route being
+   * assigned and the vehicle being placed on its first edge, so fall back to
+   * locating the current edge on the route — the same reconciliation
+   * {@link peekNextEdge} does. That lookup misses for a route that starts at
+   * the END of the current edge, which is exactly the not-started-yet case the
+   * callers above translate into "the whole route".
+   */
+  private routeEdgeIndex(vehicle: Vehicle): number {
+    if (vehicle.edgeIndex !== undefined && vehicle.edgeIndex >= 0) return vehicle.edgeIndex;
+    const route = this.routes.get(vehicle.id);
+    if (!route) return -1;
+    return route.edges.findIndex((edge) => edge.id === vehicle.currentEdge.id);
   }
 
   /**
@@ -175,7 +308,10 @@ export class RouteManager extends EventEmitter {
       const direction: Direction = {
         vehicleId: id,
         route: this.getSerializedRoute(id, route),
-        eta: utils.estimateRouteDuration(route, vehicle.speed),
+        // Remaining, not whole-route: this snapshot describes routes already in
+        // flight, so the useful number is the time still to run.
+        eta: this.etaSecondsFor(vehicle),
+        etaBreakdown: this.etaBreakdownFor(id),
       };
       if (vehicle.waypoints) {
         direction.waypoints = vehicle.waypoints;
@@ -183,6 +319,28 @@ export class RouteManager extends EventEmitter {
       }
       return direction;
     });
+  }
+
+  /**
+   * Every routed vehicle's whole-route ETA and breakdown, repriced at the
+   * network's current state.
+   *
+   * Broadcast on the `eta` channel when the weather factor moves (see
+   * `setup/eventWiring`). Deliberately not the route: re-sending every route to
+   * correct a number would dwarf the correction, and the route has not changed.
+   */
+  getEtaUpdates(): VehicleEtaUpdate[] {
+    const updates: VehicleEtaUpdate[] = [];
+    for (const vehicleId of this.routes.keys()) {
+      const pricing = this.pricingFor(vehicleId);
+      if (!pricing) continue;
+      updates.push({
+        vehicleId,
+        eta: pricing.totalSeconds,
+        etaBreakdown: pricing.breakdown,
+      });
+    }
+    return updates;
   }
 
   // ─── Random destination ───────────────────────────────────────────
@@ -200,11 +358,9 @@ export class RouteManager extends EventEmitter {
     if (!vehicle) return;
 
     const destination = this.pickDestination();
-    const startNode = vehicle.currentEdge.end;
 
     const profile = getProfile(vehicle.type);
-    this.network
-      .findRouteAsync(startNode, destination, profile.restrictedHighways)
+    this.routeFromCurrentEdge(vehicle, destination, profile.restrictedHighways)
       .then((route) => {
         if (!this.registry.has(vehicleId)) return;
 
@@ -212,7 +368,9 @@ export class RouteManager extends EventEmitter {
           // Same reasoning as findAndSetRoutes: a wander destination replaces a
           // multi-stop route, so its legs must not outlive it.
           this.clearWaypointState(vehicle);
-          this.setRouteFor(vehicleId, route);
+          // Routed from the end of the current edge, so that edge is the
+          // arrival edge and its turn onto the route is charged.
+          this.setRouteFor(vehicleId, route, vehicle.currentEdge);
           vehicle.edgeIndex = -1;
           if (this.unroutedAttempts.delete(vehicleId)) {
             setUnroutedVehicles(this.countUnroutedVehicles());
@@ -220,7 +378,8 @@ export class RouteManager extends EventEmitter {
           this.emit("direction", {
             vehicleId,
             route: this.getSerializedRoute(vehicleId, route),
-            eta: utils.estimateRouteDuration(route, vehicle.speed),
+            eta: this.pricingFor(vehicleId)?.totalSeconds,
+            etaBreakdown: this.etaBreakdownFor(vehicleId),
             reason: "random",
           });
         }
@@ -228,6 +387,29 @@ export class RouteManager extends EventEmitter {
       .catch((error) => {
         logger.warn("Pathfinding failed for vehicle %s: %o", vehicleId, error);
       });
+  }
+
+  /**
+   * Routes a moving vehicle from the end of its current edge, with that edge as
+   * the search's arrival edge so the turn it makes there obeys the same bans,
+   * U-turn rule and turn cost as every later turn. If that constraint leaves no
+   * route (e.g. every exit is banned), retries unconstrained rather than
+   * stranding the vehicle.
+   */
+  private async routeFromCurrentEdge(
+    vehicle: Vehicle,
+    destination: Node,
+    restrictedHighways?: string[]
+  ): Promise<Route | null> {
+    const arrival = vehicle.currentEdge;
+    const route = await this.network.findRouteAsync(
+      arrival.end,
+      destination,
+      restrictedHighways,
+      arrival
+    );
+    if (route) return route;
+    return this.network.findRouteAsync(arrival.end, destination, restrictedHighways);
   }
 
   // ─── Next edge logic ──────────────────────────────────────────────
@@ -332,10 +514,13 @@ export class RouteManager extends EventEmitter {
 
         const nextLeg = multiRoute.legs[wpIndex + 1];
         if (nextLeg) {
-          this.setRouteFor(vehicle.id, {
-            edges: nextLeg.edges,
-            distance: nextLeg.distance,
-          });
+          this.setRouteFor(
+            vehicle.id,
+            { edges: nextLeg.edges, distance: nextLeg.distance },
+            // The leg starts where the previous one ended, so the turn out of
+            // the stop is charged like every other turn on the trip.
+            vehicle.currentEdge
+          );
           vehicle.currentWaypointIndex = wpIndex + 1;
           vehicle.edgeIndex = -1;
         }
@@ -381,17 +566,30 @@ export class RouteManager extends EventEmitter {
     route?: Route
   ): void {
     let remainingDistance = (vehicle.speed / 3600) * (deltaMs / 1000);
+    // Learned speed profiles: only route-following vehicles are measured (see
+    // TraversalRecorder). `msLeft` is the movement time not yet attributed to
+    // an edge; speed is constant within a tick, so the time spent reaching an
+    // edge's end is its share of the distance.
+    const recorder = route ? this.traversals : null;
+    let msLeft = deltaMs;
 
     while (remainingDistance > 0) {
       const edgeRemaining = (1 - vehicle.progress) * vehicle.currentEdge.distance;
 
       if (remainingDistance >= edgeRemaining) {
         vehicle.progress = 1;
+        // speed > 0 here (remainingDistance > 0); km/h -> km per ms is / 3.6e6.
+        const msToEnd = recorder ? edgeRemaining / (vehicle.speed / 3_600_000) : 0;
         remainingDistance -= edgeRemaining;
 
         this.updateVehiclePositionAndBearing(vehicle);
 
+        const completedEdge = vehicle.currentEdge;
         const nextEdgeResult = this.getNextEdgeForVehicle(vehicle, route);
+        if (recorder) {
+          msLeft -= msToEnd;
+          recorder.exit(vehicle, msToEnd, nextEdgeResult?.edge ?? null, options.turnThreshold);
+        }
         if (!nextEdgeResult) {
           // Set speed from options after handleRouteCompleted set it to 0
           vehicle.speed = options.minSpeed;
@@ -407,6 +605,7 @@ export class RouteManager extends EventEmitter {
         if (nextEdgeResult.edgeIndex !== undefined) {
           vehicle.edgeIndex = nextEdgeResult.edgeIndex;
         }
+        recorder?.enter(vehicle, completedEdge, nextEdgeResult.edge, options.turnThreshold);
       } else {
         vehicle.progress += remainingDistance / vehicle.currentEdge.distance;
         remainingDistance = 0;
@@ -414,6 +613,9 @@ export class RouteManager extends EventEmitter {
         this.updateVehiclePositionAndBearing(vehicle);
       }
     }
+    // Whatever is left (including a whole tick at speed 0) was spent on the
+    // edge the vehicle is on now.
+    recorder?.accrue(vehicle, msLeft);
   }
 
   private updateVehiclePositionAndBearing(vehicle: Vehicle): void {
@@ -499,7 +701,9 @@ export class RouteManager extends EventEmitter {
 
   updateSpeed(vehicle: Vehicle, deltaMs: number, options: StartOptions): void {
     const profile = getProfile(vehicle.type);
-    const edgeMaxSpeed = vehicle.currentEdge.maxSpeed;
+    // Free-flow speed, not the posted limit: it is what the routing cost is
+    // priced at, so simulated driving matches the ETA the route was chosen on.
+    const edgeMaxSpeed = vehicle.currentEdge.freeFlowSpeed ?? vehicle.currentEdge.maxSpeed;
 
     const hour = this.getClockHour?.() ?? new Date().getHours();
     const isHighway =
@@ -546,7 +750,16 @@ export class RouteManager extends EventEmitter {
     // clamping applyTimeOfDay used — three couplings that silently produce
     // wrong numbers the moment any of them drifts.
     const environmentFactor = Math.min(speedFactor, congestion);
-    const effectiveMax = Math.min(profile.maxSpeed, adjustedEdgeMaxSpeed) * environmentFactor;
+
+    // Weather (fleetsim-all-1ajn.5) is a genuinely independent physical effect
+    // — unlike heat zones and congestion it shares no demand curve with
+    // anything else in this method — so it composes by MULTIPLYING rather than
+    // MIN-ing with `environmentFactor`. That's the same composition
+    // `applyDynamicCost` uses for weather x incidents in the routing cost, so a
+    // route's ETA and how fast the vehicle actually drives it agree.
+    const weatherFactor = this.network.getWeatherFactor();
+    const effectiveMax =
+      Math.min(profile.maxSpeed, adjustedEdgeMaxSpeed) * environmentFactor * weatherFactor;
 
     if (!vehicle.targetSpeed || rng() < deltaMs / 5000) {
       const variation = 1 + (rng() * 2 - 1) * options.speedVariation;
@@ -603,10 +816,19 @@ export class RouteManager extends EventEmitter {
    * candidates, and `findAndSetRoutes` can't be used for that because it
    * teleports the vehicle onto the first edge of the route it finds.
    *
-   * The ETA is computed against the vehicle's profile cruise speed rather than
-   * its instantaneous `speed`, because an idle candidate has `speed === 0` and
+   * The ETA prices each edge at its free-flow speed capped by the profile's top
+   * speed (the movement model's cap) rather than the vehicle's instantaneous
+   * `speed`, because an idle candidate has `speed === 0` and
    * would otherwise price out at infinity — exactly backwards, since idle
    * vehicles are the ones worth dispatching.
+   *
+   * NOT identical to the route search's cost: the ETA models how the simulated
+   * vehicle will actually drive the route, so it leaves out the terms the
+   * search uses only to CHOOSE a route and that `updateSpeed` never applies to
+   * movement — the static surface / smoothness / BPR penalties baked into the
+   * base cost, and incident speed factors. Adding them here would make ETAs
+   * disagree with simulated arrival times. Terms both sides share (free-flow
+   * or learned speed, node delay, turn cost, weather) are priced identically.
    */
   async estimateTo(
     vehicleId: string,
@@ -620,12 +842,65 @@ export class RouteManager extends EventEmitter {
     if (startNode.connections.length === 0 || endNode.connections.length === 0) return null;
 
     const profile = getProfile(vehicle.type);
-    const route = await this.network.findRouteAsync(startNode, endNode, profile.restrictedHighways);
+    // Starting at the end of the vehicle's current edge: search with it as the
+    // arrival edge (same first-turn rules as a reroute) and charge that turn.
+    let arrival: Edge | undefined =
+      startNode.id === vehicle.currentEdge.end.id ? vehicle.currentEdge : undefined;
+    let route = await this.network.findRouteAsync(
+      startNode,
+      endNode,
+      profile.restrictedHighways,
+      arrival
+    );
+    if (!route && arrival) {
+      arrival = undefined;
+      route = await this.network.findRouteAsync(startNode, endNode, profile.restrictedHighways);
+    }
     if (!route || route.edges.length === 0) return null;
 
-    const cruise = (profile.minSpeed + profile.maxSpeed) / 2;
+    // Each edge at the speed the movement model caps it at: the edge's free-flow
+    // speed, limited by the profile's top speed. Independent of `vehicle.speed`,
+    // so an idle candidate still gets a finite ETA. Plus each edge's precomputed
+    // node-control delay (signal/stop/give-way/crossing/level-crossing/traffic-
+    // calming at the edge's end) — the same term `applyDynamicCost` adds during
+    // pathfinding, so `best_eta` candidate comparisons and the route search
+    // price a stop/signal the same way. `updateSpeed` below has no stopping
+    // logic of its own (it only slows for turns/following distance/heat zones/
+    // congestion), so there is nothing to double-count against.
+    //
+    // Plus the turn cost between consecutive edges, again exactly as the search
+    // charges it (pathfinding/turns.ts) — including the first turn off the
+    // vehicle's current edge when the route starts at its end node. This deliberately does NOT mirror
+    // `updateSpeed`'s turn slowdown: that one is a pure-geometry speed dip
+    // (any bearing change over TURN_THRESHOLD, drive-side agnostic) whose time
+    // loss depends on the vehicle's acceleration profile, while the turn
+    // penalty prices the manoeuvre (yielding, crossing oncoming traffic,
+    // U-turns) that the movement model does not simulate. Both share the 30°
+    // "straight on" threshold by default.
+    //
+    // An edge with a learned speed in the active profile (speedprofiles/) is
+    // priced at that speed instead of free-flow — the (clamped) value the route
+    // search itself charged — still capped by the vehicle profile.
+    //
+    // The global weather factor (fleetsim-all-1ajn.5) scales the resulting
+    // speed down, exactly like `applyDynamicCost` scales travel TIME down by
+    // the same factor for routing cost (dividing time by a factor < 1 is
+    // equivalent to multiplying speed by it), and like `updateSpeed` scales
+    // movement. Node delay is NOT scaled by weather (a red
+    // light's expected wait doesn't get longer in the rain the way a moving
+    // edge's travel time does), matching the routing cost side.
+    const pricing = priceRoute(
+      route.edges,
+      {
+        learnedSpeedKmh: (edge) => this.network.learnedSpeedKmh(edge),
+        turnCostHours: (from, to) => this.network.turnCostHours(from, to),
+        weatherFactor: this.network.getWeatherFactor(),
+        profileMaxSpeed: profile.maxSpeed,
+      },
+      arrival
+    );
     return {
-      etaSeconds: utils.estimateRouteDuration(route, cruise),
+      etaSeconds: pricing.totalSeconds,
       distanceKm: route.distance,
     };
   }
@@ -666,18 +941,20 @@ export class RouteManager extends EventEmitter {
       };
     }
 
-    const eta = utils.estimateRouteDuration(route, vehicle.speed);
-
     // A single-destination route replaces any multi-stop one outright. Without
     // this the stale legs survive: `handleRouteCompleted` would take the
     // multi-stop branch when THIS route finishes, emit a `waypoint:reached` for
     // the abandoned trip, and put the vehicle back onto its next leg.
     this.clearWaypointState(vehicle);
+    // Unconstrained search from the nearest node, so there is no arrival edge
+    // and no first turn to charge — the vehicle is placed on `edges[0]` below.
     this.setRouteFor(vehicleId, route);
+    const eta = this.pricingFor(vehicleId)?.totalSeconds;
     this.emit("direction", {
       vehicleId,
       route: this.getSerializedRoute(vehicleId, route),
       eta,
+      etaBreakdown: this.etaBreakdownFor(vehicleId),
       reason: "dispatch",
     });
     const previousEdgeId = vehicle.currentEdge.id;
@@ -790,7 +1067,10 @@ export class RouteManager extends EventEmitter {
     vehicle.progress = 0;
     vehicle.edgeIndex = 0;
 
-    const eta = utils.estimateRouteDuration(stitchedRoute, vehicle.speed);
+    // The whole trip, not the active first leg: a multi-stop direction is the
+    // client's view of the entire run, so it is priced (and serialized) on the
+    // stitched route rather than through the per-vehicle active-route caches.
+    const stitchedPricing = this.price(vehicleId, stitchedRoute);
 
     // The emitted direction shows the full stitched multi-leg route, which is
     // distinct from the active (first-leg) route stored above — so it is
@@ -798,7 +1078,8 @@ export class RouteManager extends EventEmitter {
     this.emit("direction", {
       vehicleId,
       route: utils.nonCircularRouteEdges(stitchedRoute),
-      eta,
+      eta: stitchedPricing.totalSeconds,
+      etaBreakdown: stitchedPricing.breakdown,
       waypoints,
       currentWaypointIndex: 0,
       reason: "waypoints",
@@ -812,7 +1093,7 @@ export class RouteManager extends EventEmitter {
         end: legResults[legResults.length - 1].end,
         distance: totalDistance,
       },
-      eta,
+      eta: stitchedPricing.totalSeconds,
       snappedTo: legResults[legResults.length - 1].end,
       waypointCount: waypoints.length,
       legs: legResults,
@@ -875,19 +1156,17 @@ export class RouteManager extends EventEmitter {
     const route = this.routes.get(vehicleId);
     if (!vehicle || !route) return;
 
-    const startNode = vehicle.currentEdge.end;
     const lastEdge = route.edges[route.edges.length - 1];
     const destinationNode = lastEdge.end;
     const rerouteProfile = getProfile(vehicle.type);
 
-    this.network
-      .findRouteAsync(startNode, destinationNode, rerouteProfile.restrictedHighways)
+    this.routeFromCurrentEdge(vehicle, destinationNode, rerouteProfile.restrictedHighways)
       .then((newRoute) => {
         if (!this.registry.has(vehicleId)) return;
         if (!this.routes.has(vehicleId)) return;
 
         if (newRoute && newRoute.edges.length > 0) {
-          this.setRouteFor(vehicleId, newRoute);
+          this.setRouteFor(vehicleId, newRoute, vehicle.currentEdge);
           vehicle.edgeIndex = -1;
 
           const serialized = this.getSerializedRoute(vehicleId, newRoute);
@@ -900,7 +1179,8 @@ export class RouteManager extends EventEmitter {
           this.emit("direction", {
             vehicleId,
             route: serialized,
-            eta: utils.estimateRouteDuration(newRoute, vehicle.speed),
+            eta: this.pricingFor(vehicleId)?.totalSeconds,
+            etaBreakdown: this.etaBreakdownFor(vehicleId),
             reason: "reroute",
           });
         }
@@ -921,6 +1201,7 @@ export class RouteManager extends EventEmitter {
     this.waypointRoutes = new Map();
     this.lastPathfindAttempt = new Map();
     this.serializedRouteCache = new Map();
+    this.routePricing = new Map();
     this.rerouteQueue.clear();
     if (this.rerouteDrainTimer) {
       clearTimeout(this.rerouteDrainTimer);

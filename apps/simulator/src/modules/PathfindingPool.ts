@@ -17,6 +17,9 @@ import path from "path";
 import os from "os";
 import { DEFAULT_LANDMARK_COUNT } from "./pathfinding/landmarks";
 import type { PathfindingWorkerData } from "../workers/pathfinding-worker";
+import type { HighwayType } from "../types";
+import type { DriveSide } from "./pathfinding/turns";
+import type { SpeedOverrideTable } from "./speedprofiles/SpeedProfileStore";
 import logger from "../utils/logger";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -53,6 +56,12 @@ export interface PathfindingPoolOptions {
    * `PATHFINDING_LANDMARKS`) so the workers and the main-thread graph agree.
    */
   landmarkCount?: number;
+  /** Per-highway-class free-flow factors; must match the main-thread graph's. */
+  freeFlowFactors?: Record<HighwayType, number>;
+  /** Drive side for turn penalties; must match the main-thread graph's. */
+  driveSide?: DriveSide;
+  /** Learned speed profile ratio (null/absent = disabled); must match the main-thread graph's. */
+  speedProfileRatio?: number | null;
 }
 
 export class PathfindingPool {
@@ -104,7 +113,17 @@ export class PathfindingPool {
       workerCandidates.find((p) => fs.existsSync(p)) ??
       workerCandidates[workerCandidates.length - 1];
 
-    const workerData: PathfindingWorkerData = { geojsonPath, landmarkCount };
+    const freeFlowFactors = typeof options === "number" ? undefined : options?.freeFlowFactors;
+    const driveSide = typeof options === "number" ? undefined : options?.driveSide;
+    const speedProfileRatio =
+      typeof options === "number" ? null : (options?.speedProfileRatio ?? null);
+    const workerData: PathfindingWorkerData = {
+      geojsonPath,
+      landmarkCount,
+      freeFlowFactors,
+      driveSide,
+      speedProfileRatio,
+    };
 
     for (let i = 0; i < size; i++) {
       const worker = new Worker(workerPath, { workerData });
@@ -157,8 +176,7 @@ export class PathfindingPool {
     endId: string,
     incidentEdges?: Map<string, number>,
     restrictedHighways?: string[],
-    turnRestrictions?: Record<string, string[]>,
-    turnRestrictionTypes?: Record<string, string>
+    arrival?: { edgeId: string; startId: string }
   ): Promise<PathfindingResult | null> {
     if (this.workers.length === 0) {
       return Promise.resolve(null);
@@ -203,14 +221,37 @@ export class PathfindingPool {
       if (restrictedHighways && restrictedHighways.length > 0) {
         msg.restrictedHighways = restrictedHighways;
       }
-      if (turnRestrictions) {
-        msg.turnRestrictions = turnRestrictions;
-      }
-      if (turnRestrictionTypes) {
-        msg.turnRestrictionTypes = turnRestrictionTypes;
+      if (arrival) {
+        msg.arrival = arrival;
       }
       worker.postMessage(msg);
     });
+  }
+
+  /**
+   * Sends a learned-speed table to every worker. A worker processes its
+   * messages in order, so each route request posted after this is searched with
+   * the new table. The typed arrays are structured-cloned (the table is sparse:
+   * only edges with enough samples in the active bucket).
+   */
+  public setSpeedOverrides(table: SpeedOverrideTable): void {
+    for (const worker of this.workers) {
+      worker.postMessage({ type: "speedProfile", indices: table.indices, speeds: table.speeds });
+    }
+  }
+
+  /**
+   * Sends the global weather speed factor to every worker (fleetsim-all-1ajn.5).
+   * Persists like the learned-speed table above (not per-request like
+   * incidents): weather changes rarely (poll interval, or a manual override)
+   * and applies to every edge, so every request after this uses it until
+   * replaced. `RoadNetwork` replays the last factor when the pool is lazily
+   * created after weather is already set.
+   */
+  public setWeatherFactor(factor: number): void {
+    for (const worker of this.workers) {
+      worker.postMessage({ type: "weather", factor });
+    }
   }
 
   /**

@@ -3,6 +3,7 @@ import type { VehicleManager } from "../VehicleManager";
 import type { IncidentManager } from "../IncidentManager";
 import type { JobManager } from "../JobManager";
 import type { SimulationController } from "../SimulationController";
+import type { WeatherManager } from "../weather/WeatherManager";
 import {
   scenarioSchema,
   type Scenario,
@@ -16,6 +17,7 @@ import {
   type SetTrafficProfileAction,
   type ClearIncidentsAction,
   type SetOptionsAction,
+  type SetWeatherAction,
 } from "./types";
 import type { VehicleType } from "../../types";
 import { createLogger } from "../../utils/logger";
@@ -36,6 +38,8 @@ type ClockMode = "wall" | "manual";
 export class ScenarioManager extends EventEmitter {
   private scenario: Scenario | null = null;
   private state: ScenarioState = "idle";
+  /** Whether a `set_weather` event of the current run set a weather override. */
+  private weatherOverridden = false;
   private startTime: number = 0; // wall-clock ms when scenario started
   private pausedAt: number = 0; // elapsed ms when paused
   private eventIndex: number = 0; // next event to execute
@@ -54,7 +58,12 @@ export class ScenarioManager extends EventEmitter {
      * a scenario carrying `create_job` events needs it (see
      * {@link handleCreateJob}).
      */
-    private jobManager?: JobManager
+    private jobManager?: JobManager,
+    /**
+     * Optional, same reasoning as `jobManager`; a scenario carrying
+     * `set_weather` events needs it (see {@link handleSetWeather}).
+     */
+    private weatherManager?: WeatherManager
   ) {
     super();
   }
@@ -232,6 +241,7 @@ export class ScenarioManager extends EventEmitter {
     const executed = this.eventsExecuted;
 
     this.clearTimers();
+    this.clearScenarioWeather();
     this.state = "idle";
     this.eventIndex = 0;
     this.eventsExecuted = 0;
@@ -285,6 +295,7 @@ export class ScenarioManager extends EventEmitter {
 
   private resetState(): void {
     this.clearTimers();
+    this.clearScenarioWeather();
     this.state = "idle";
     this.eventIndex = 0;
     this.eventsExecuted = 0;
@@ -419,6 +430,9 @@ export class ScenarioManager extends EventEmitter {
         break;
       case "create_job":
         return this.handleCreateJob(action);
+      case "set_weather":
+        this.handleSetWeather(action);
+        break;
     }
   }
 
@@ -525,6 +539,27 @@ export class ScenarioManager extends EventEmitter {
 
   private handleSetOptions(action: SetOptionsAction): void {
     this.vehicleManager.setOptions(action.options);
+  }
+
+  private handleSetWeather(action: SetWeatherAction): void {
+    if (!this.weatherManager) {
+      throw new Error(
+        "Scenario contains a set_weather event but no WeatherManager is wired to the ScenarioManager"
+      );
+    }
+    this.weatherManager.setOverride({ condition: action.condition, factor: action.factor });
+    this.weatherOverridden = true;
+  }
+
+  /**
+   * Reverts a weather override THIS scenario set (on stop / reset), so a
+   * scenario's snow does not outlive it. An override set by an operator via
+   * `POST /weather` while no scenario touched weather is left alone.
+   */
+  private clearScenarioWeather(): void {
+    if (!this.weatherOverridden) return;
+    this.weatherOverridden = false;
+    this.weatherManager?.clearOverride();
   }
 
   private async handleCreateJob(action: CreateJobAction): Promise<void> {

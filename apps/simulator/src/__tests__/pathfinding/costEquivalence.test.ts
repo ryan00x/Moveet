@@ -4,7 +4,12 @@ import { RoadNetwork } from "../../modules/RoadNetwork";
 import {
   computeBaseTravelTime as sharedBase,
   applyDynamicCost as sharedDynamic,
-  SIGNAL_DELAY_H,
+  computeNodeDelayS,
+  nodeDelayHours,
+  mergeNodeControl,
+  clampWeatherFactor,
+  MIN_WEATHER_FACTOR,
+  type NodeControl,
 } from "../../modules/pathfinding/cost";
 import { PathNodeHeap } from "../../modules/pathfinding/heap";
 import {
@@ -46,16 +51,167 @@ describe("pathfinding/cost (shared module)", () => {
     expect(sharedBase(baseEdge, flow)).toBeCloseTo((1 / 60) * 1.15, 12);
   });
 
-  it("applyDynamicCost divides by incident factor < 1 and adds signal delay", () => {
+  it("applyDynamicCost divides by incident factor < 1 and adds the node delay", () => {
     const base = 0.02;
-    expect(sharedDynamic(base, undefined, false)).toBe(base);
-    expect(sharedDynamic(base, 0.5, false)).toBeCloseTo(base / 0.5, 12);
-    expect(sharedDynamic(base, undefined, true)).toBeCloseTo(base + SIGNAL_DELAY_H, 12);
-    expect(sharedDynamic(base, 0.5, true)).toBeCloseTo(base / 0.5 + SIGNAL_DELAY_H, 12);
+    const delayH = 15 / 3600;
+    expect(sharedDynamic(base, undefined, 0)).toBe(base);
+    expect(sharedDynamic(base, 0.5, 0)).toBeCloseTo(base / 0.5, 12);
+    expect(sharedDynamic(base, undefined, delayH)).toBeCloseTo(base + delayH, 12);
+    expect(sharedDynamic(base, 0.5, delayH)).toBeCloseTo(base / 0.5 + delayH, 12);
   });
 
   it("ignores an incident factor of exactly 1 (no slowdown)", () => {
-    expect(sharedDynamic(0.02, 1, false)).toBe(0.02);
+    expect(sharedDynamic(0.02, 1, 0)).toBe(0.02);
+  });
+
+  // ─── Weather (fleetsim-all-1ajn.5) ────────────────────────────────
+
+  it("applyDynamicCost divides by a weather factor < 1 when no incident applies", () => {
+    const base = 0.02;
+    expect(sharedDynamic(base, undefined, 0, 0.5)).toBeCloseTo(base / 0.5, 12);
+  });
+
+  it("ignores a weather factor of exactly 1 or undefined", () => {
+    expect(sharedDynamic(0.02, undefined, 0, 1)).toBe(0.02);
+    expect(sharedDynamic(0.02, undefined, 0, undefined)).toBe(0.02);
+  });
+
+  it("composes weather and incident factors multiplicatively", () => {
+    const base = 0.02;
+    // incident 0.5 x weather 0.8 = combined 0.4
+    expect(sharedDynamic(base, 0.5, 0, 0.8)).toBeCloseTo(base / (0.5 * 0.8), 12);
+  });
+
+  it("still adds the node delay on top of a weather-scaled travel time", () => {
+    const base = 0.02;
+    const delayH = 10 / 3600;
+    expect(sharedDynamic(base, undefined, delayH, 0.5)).toBeCloseTo(base / 0.5 + delayH, 12);
+  });
+
+  it("clampWeatherFactor keeps the factor in (0, 1]", () => {
+    expect(clampWeatherFactor(1)).toBe(1);
+    expect(clampWeatherFactor(0.7)).toBe(0.7);
+    // Never a discount: anything >= 1 (or non-finite) collapses to 1 (no effect).
+    expect(clampWeatherFactor(1.5)).toBe(1);
+    expect(clampWeatherFactor(Infinity)).toBe(1);
+    expect(clampWeatherFactor(NaN)).toBe(1);
+    // Never at/below 0 (would price an edge at infinity): floored.
+    expect(clampWeatherFactor(0)).toBe(MIN_WEATHER_FACTOR);
+    expect(clampWeatherFactor(-1)).toBe(MIN_WEATHER_FACTOR);
+    expect(clampWeatherFactor(0.01)).toBe(MIN_WEATHER_FACTOR);
+  });
+});
+
+// ─── Typed node-control delays (fleetsim-all-1ajn.2) ──────────────────
+
+describe("computeNodeDelayS", () => {
+  it("gives a signalized major-road approach less delay than a minor one", () => {
+    const control: NodeControl = { kind: "traffic_signals", direction: "both" };
+    const major = computeNodeDelayS(control, "primary");
+    const minor = computeNodeDelayS(control, "residential");
+    expect(major).toBeGreaterThan(0);
+    expect(major).toBeLessThan(minor);
+  });
+
+  it("halves the signal delay when traffic_signals:direction is one-directional", () => {
+    const both = computeNodeDelayS({ kind: "traffic_signals", direction: "both" }, "primary");
+    const forward = computeNodeDelayS({ kind: "traffic_signals", direction: "forward" }, "primary");
+    expect(forward).toBeCloseTo(both / 2, 12);
+  });
+
+  it("gives a mandatory stop a fixed delay regardless of approach class", () => {
+    const major = computeNodeDelayS({ kind: "stop" }, "primary");
+    const minor = computeNodeDelayS({ kind: "stop" }, "residential");
+    expect(major).toBe(minor);
+    expect(major).toBeGreaterThan(0);
+  });
+
+  it("gives give-way a smaller delay than a full stop", () => {
+    expect(computeNodeDelayS({ kind: "give_way" }, "residential")).toBeLessThan(
+      computeNodeDelayS({ kind: "stop" }, "residential")
+    );
+  });
+
+  it("scales crossing delay by crossing subtype: signal > marked > unmarked", () => {
+    const signal = computeNodeDelayS({ kind: "crossing", subtype: "traffic_signals" }, "primary");
+    const marked = computeNodeDelayS({ kind: "crossing", subtype: "marked" }, "primary");
+    const unmarked = computeNodeDelayS({ kind: "crossing", subtype: "unmarked" }, "primary");
+    expect(signal).toBeGreaterThan(marked);
+    expect(marked).toBeGreaterThan(unmarked);
+    expect(unmarked).toBeGreaterThan(0);
+  });
+
+  it("treats zebra/uncontrolled/unspecified crossings like marked", () => {
+    const marked = computeNodeDelayS({ kind: "crossing", subtype: "marked" }, "primary");
+    expect(computeNodeDelayS({ kind: "crossing", subtype: "zebra" }, "primary")).toBe(marked);
+    expect(computeNodeDelayS({ kind: "crossing", subtype: "uncontrolled" }, "primary")).toBe(
+      marked
+    );
+    expect(computeNodeDelayS({ kind: "crossing" }, "primary")).toBe(marked);
+  });
+
+  it("gives a railway level crossing a small positive expected delay", () => {
+    expect(computeNodeDelayS({ kind: "level_crossing" }, "primary")).toBeGreaterThan(0);
+  });
+
+  it("gives point traffic-calming a small positive delay, varying by subtype", () => {
+    const table = computeNodeDelayS({ kind: "traffic_calming", subtype: "table" }, "residential");
+    const rumble = computeNodeDelayS(
+      { kind: "traffic_calming", subtype: "rumble_strip" },
+      "residential"
+    );
+    expect(table).toBeGreaterThan(0);
+    expect(rumble).toBeGreaterThan(0);
+    expect(table).toBeGreaterThan(rumble);
+  });
+
+  it("never produces a negative delay", () => {
+    const kinds: NodeControl[] = [
+      { kind: "traffic_signals", direction: "both" },
+      { kind: "stop" },
+      { kind: "give_way" },
+      { kind: "crossing", subtype: "unmarked" },
+      { kind: "level_crossing" },
+      { kind: "traffic_calming", subtype: "bump" },
+    ];
+    for (const control of kinds) {
+      expect(computeNodeDelayS(control, "residential")).toBeGreaterThanOrEqual(0);
+    }
+  });
+});
+
+describe("nodeDelayHours", () => {
+  it("returns 0 for an undefined control", () => {
+    expect(nodeDelayHours(undefined, "primary")).toBe(0);
+  });
+
+  it("converts computeNodeDelayS's seconds to hours", () => {
+    const control: NodeControl = { kind: "stop" };
+    expect(nodeDelayHours(control, "residential")).toBeCloseTo(
+      computeNodeDelayS(control, "residential") / 3600,
+      12
+    );
+  });
+});
+
+describe("mergeNodeControl", () => {
+  it("keeps the incoming control when nothing exists yet", () => {
+    const incoming: NodeControl = { kind: "stop" };
+    expect(mergeNodeControl(undefined, incoming)).toBe(incoming);
+  });
+
+  it("prefers a level crossing over a traffic signal at the same node", () => {
+    const signal: NodeControl = { kind: "traffic_signals", direction: "both" };
+    const crossing: NodeControl = { kind: "level_crossing" };
+    expect(mergeNodeControl(signal, crossing)).toBe(crossing);
+    expect(mergeNodeControl(crossing, signal)).toBe(crossing);
+  });
+
+  it("prefers a stop over a give-way", () => {
+    const stop: NodeControl = { kind: "stop" };
+    const giveWay: NodeControl = { kind: "give_way" };
+    expect(mergeNodeControl(giveWay, stop)).toBe(stop);
+    expect(mergeNodeControl(stop, giveWay)).toBe(stop);
   });
 });
 
@@ -107,11 +263,13 @@ describe("worker inline cost stays in lockstep with the shared module", () => {
     }
   });
 
-  it("applyDynamicCost matches across incident/signal combinations", () => {
+  it("applyDynamicCost matches across incident/node-delay combinations", () => {
     for (const base of [0.005, 0.02, 0.5]) {
       for (const factor of [undefined, 0.2, 0.5, 1] as const) {
-        for (const signal of [false, true]) {
-          expect(workerDynamic(base, factor, signal)).toBe(sharedDynamic(base, factor, signal));
+        for (const nodeDelayH of [0, 15 / 3600, 25 / 3600]) {
+          expect(workerDynamic(base, factor, nodeDelayH)).toBe(
+            sharedDynamic(base, factor, nodeDelayH)
+          );
         }
       }
     }
@@ -168,6 +326,46 @@ describe("main-thread and worker A* return equivalent routes", () => {
       }
     }
     expect(comparisons).toBeGreaterThan(0);
+  });
+});
+
+// ─── Turn model inputs: main-thread graph vs worker graph (fleetsim-all-1ajn.3) ──
+
+describe("main-thread and worker graphs agree on turn-model inputs", () => {
+  it("stamps identical node degrees, signal flags and edge bearings/oneway", () => {
+    const network = new RoadNetwork(fixture);
+    const workerNodes = buildGraph(fixture);
+    // @ts-expect-error — private graph, as the other RoadNetwork tests do.
+    const mainNodes = network.nodes as Map<string, import("../../types").Node>;
+
+    expect([...workerNodes.keys()]).toEqual([...mainNodes.keys()]);
+    for (const [id, workerNode] of workerNodes) {
+      const mainNode = mainNodes.get(id)!;
+      expect(workerNode.degree).toBe(mainNode.degree);
+      expect(Boolean(workerNode.trafficSignal)).toBe(Boolean(mainNode.trafficSignal));
+      expect(workerNode.edges.map((e) => e.id)).toEqual(mainNode.connections.map((e) => e.id));
+      workerNode.edges.forEach((edge, i) => {
+        expect(edge.bearing).toBe(mainNode.connections[i].bearing);
+        expect(edge.oneway).toBe(mainNode.connections[i].oneway);
+      });
+    }
+  });
+
+  it("returns identical routes in left-hand traffic too", () => {
+    const network = new RoadNetwork(fixture, { driveSide: "left" });
+    const workerNodes = buildGraph(fixture, undefined, undefined, "left");
+    const nodeIds = [...workerNodes.keys()];
+    for (const a of nodeIds) {
+      for (const b of nodeIds) {
+        if (a === b) continue;
+        const main = network.findRoute(
+          network.findNearestNode(parseKey(a)),
+          network.findNearestNode(parseKey(b))
+        );
+        const worker = workerFindRoute(workerNodes, a, b);
+        expect(main ? main.edges.map((e) => e.id) : null).toEqual(worker ? worker.edgeIds : null);
+      }
+    }
   });
 });
 

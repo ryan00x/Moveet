@@ -11,4 +11,6 @@ export { createAnalyticsRoutes } from "./analytics";
 export { createScenarioRoutes } from "./scenarios";
 export { createStateRoutes } from "./state";
 export { createMetricsRoutes } from "./metrics";
+export { createSpeedProfileRoutes } from "./speedProfiles";
+export { createWeatherRoutes } from "./weather";
 export type { RouteContext } from "./types";

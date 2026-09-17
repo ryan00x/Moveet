@@ -1,6 +1,6 @@
 /**
  * Builds the road-network graph (nodes, edges, roads, connected-edge lookups,
- * per-edge base costs, turn restrictions) from a GeoJSON FeatureCollection, and
+ * per-edge base costs, turn bans, node degrees) from a GeoJSON FeatureCollection, and
  * eagerly derives every product that was previously read lazily from the raw
  * FeatureCollection (POIs, speed-limit signs, the LineString-only feature view).
  *
@@ -15,7 +15,15 @@ import crypto from "crypto";
 import type { Feature, FeatureCollection, LineString } from "geojson";
 import type { Node, Edge, POI, HighwayType } from "../../types";
 import * as utils from "../../utils/helpers";
-import { computeBaseTravelTime } from "../pathfinding/cost";
+import {
+  computeBaseTravelTime,
+  landmarkLowerBoundCost,
+  mergeNodeControl,
+  nodeDelayHours,
+  TRAFFIC_CALMING_MAX_SPEED_KMH,
+  type NodeControl,
+} from "../pathfinding/cost";
+import { parseTurnRestriction, resolveTurnBans, type TurnRestriction } from "../pathfinding/turns";
 import {
   type AltIndexed,
   type LandmarkIndex,
@@ -28,8 +36,11 @@ import {
   type Road,
   type Street,
   parseSmoothness,
-  parseMaxSpeed,
+  resolveMaxSpeed,
   parseOneway,
+  parseNodeControls,
+  MAX_CONTROL_SNAP_KM,
+  DEFAULT_FREE_FLOW_FACTORS,
   VALID_HIGHWAYS,
 } from "./types";
 
@@ -47,8 +58,12 @@ export interface BuiltNetwork {
   roads: Map<string, Road>;
   edgeBaseCost: Map<string, number>;
   connectedEdges: Map<string, Edge[]>;
-  turnRestrictions: Map<string, Set<string>>;
-  turnRestrictionTypes: Map<string, "prohibitory" | "mandatory">;
+  /**
+   * OSM turn restrictions resolved to edge level: arriving edge id -> ids of
+   * the edges that may NOT follow it (see `pathfinding/turns.ts`). Empty when
+   * the GeoJSON carries no restriction features.
+   */
+  turnBans: Map<string, Set<string>>;
   maxNetworkSpeed: number;
   /** Eagerly-extracted POIs (Point features). */
   pois: POI[];
@@ -75,20 +90,39 @@ export interface GraphBuilderOptions {
    * `utils/config.ts` and threaded down from `RoadNetwork`.
    */
   landmarkCount?: number;
+  /**
+   * Per-highway-class free-flow factors (`FREE_FLOW_FACTORS`, parsed by the zod
+   * schema). Defaults to {@link DEFAULT_FREE_FLOW_FACTORS}.
+   */
+  freeFlowFactors?: Readonly<Record<HighwayType, number>>;
+  /**
+   * Learned speed profiles' `SPEED_PROFILE_MAX_SPEED_RATIO` when they are
+   * enabled, `null`/absent when they are not. When set, the landmark tables and
+   * `maxNetworkSpeed` are built on a metric that also lower-bounds every learned
+   * cost (see `pathfinding/cost.ts` `landmarkLowerBoundCost`).
+   */
+  speedProfileRatio?: number | null;
 }
 
 export class GraphBuilder {
   private readonly landmarkCount: number;
+  private readonly freeFlowFactors: Readonly<Record<HighwayType, number>>;
+  private readonly speedProfileRatio: number | null;
   private nodes: Map<string, Node> = new Map();
   private edges: Map<string, Edge> = new Map();
   private roads: Map<string, Road> = new Map();
   private edgeBaseCost: Map<string, number> = new Map();
   private connectedEdges: Map<string, Edge[]> = new Map();
-  private turnRestrictions: Map<string, Set<string>> = new Map();
-  private turnRestrictionTypes: Map<string, "prohibitory" | "mandatory"> = new Map();
+  /** Parsed restriction relations, resolved to `turnBans` once the graph exists. */
+  private turnRestrictions: TurnRestriction[] = [];
+  private turnBans: Map<string, Set<string>> = new Map();
+  /** Merged node control (signal/stop/give-way/crossing/level-crossing/calming) by node id. */
+  private nodeControls: Map<string, NodeControl> = new Map();
 
   constructor(options?: GraphBuilderOptions) {
     this.landmarkCount = options?.landmarkCount ?? DEFAULT_LANDMARK_COUNT;
+    this.freeFlowFactors = options?.freeFlowFactors ?? DEFAULT_FREE_FLOW_FACTORS;
+    this.speedProfileRatio = options?.speedProfileRatio ?? null;
   }
 
   private snapCoord(val: number): string {
@@ -115,16 +149,23 @@ export class GraphBuilder {
   public build(data: FeatureCollection): BuiltNetwork {
     this.buildGraph(data);
     this.buildEdgeBaseCosts();
+    this.stampNodeDegrees();
+    this.buildTurnBans();
 
+    // Upper bound on the speed the cost is priced at (free-flow ≤ posted), so
+    // distance / maxNetworkSpeed never overestimates an edge's base cost.
     let maxSpeed = 0;
     for (const edge of this.edges.values()) {
-      if (edge.maxSpeed > maxSpeed) maxSpeed = edge.maxSpeed;
+      const speed = edge.freeFlowSpeed ?? edge.maxSpeed;
+      if (speed > maxSpeed) maxSpeed = speed;
     }
-    const maxNetworkSpeed = maxSpeed > 0 ? maxSpeed : 110;
+    // A learned speed may reach freeFlowSpeed × ratio, so the bound scales too.
+    const maxNetworkSpeed = (maxSpeed > 0 ? maxSpeed : 110) * (this.speedProfileRatio ?? 1);
 
-    // ALT landmark preprocessing. Runs on the STATIC base costs only, so the
-    // bounds it yields stay admissible under the dynamic incident/signal terms
-    // A* adds at query time (see pathfinding/landmarks.ts).
+    // ALT landmark preprocessing. Runs on the STATIC base costs only (or their
+    // learned-speed lower bound when profiles are enabled), so the bounds it
+    // yields stay admissible under the dynamic incident/signal terms A* adds at
+    // query time (see pathfinding/landmarks.ts).
     const landmarks = this.buildLandmarks();
 
     // Eagerly derive the data-backed collections so the raw FeatureCollection
@@ -139,8 +180,7 @@ export class GraphBuilder {
       roads: this.roads,
       edgeBaseCost: this.edgeBaseCost,
       connectedEdges: this.connectedEdges,
-      turnRestrictions: this.turnRestrictions,
-      turnRestrictionTypes: this.turnRestrictionTypes,
+      turnBans: this.turnBans,
       maxNetworkSpeed,
       pois,
       speedLimits,
@@ -182,7 +222,16 @@ export class GraphBuilder {
       if (cost === undefined) continue;
       from[edgeCount] = (edge.start as Node & AltIndexed).altIndex!;
       to[edgeCount] = (edge.end as Node & AltIndexed).altIndex!;
-      weight[edgeCount] = cost;
+      // + the static node-control delay: A* charges it on every relaxation
+      // (never scaled by incidents/weather), so it is part of every edge's true
+      // cost and folding it in keeps the bound admissible while tightening it.
+      weight[edgeCount] =
+        landmarkLowerBoundCost(
+          cost,
+          edge.distance,
+          edge.freeFlowSpeed ?? edge.maxSpeed,
+          this.speedProfileRatio
+        ) + (edge.nodeDelayH ?? 0);
       edgeCount++;
     }
 
@@ -193,8 +242,11 @@ export class GraphBuilder {
   private buildGraph(data: FeatureCollection): void {
     data.features.forEach((feature) => {
       if (feature.geometry?.type === "LineString") {
-        const streetId =
-          feature.properties?.id || feature.properties?.["@id"] || crypto.randomUUID();
+        // OSM way id when present (the network CLI exports it as `@id`), which is
+        // what turn restrictions reference; stringified so ids compare equal.
+        const streetId = String(
+          feature.properties?.id || feature.properties?.["@id"] || crypto.randomUUID()
+        );
         // Stamp the resolved streetId back onto the feature for the /network API
         feature.properties!.streetId = streetId;
         const streetName = feature.properties?.name || "";
@@ -205,14 +257,26 @@ export class GraphBuilder {
         const highway: HighwayType = VALID_HIGHWAYS.has(rawHighway)
           ? (rawHighway as HighwayType)
           : "residential";
-        const maxSpeed = parseMaxSpeed(feature.properties?.maxspeed, highway);
+        const forwardMaxSpeed = resolveMaxSpeed(feature.properties, highway, "forward");
+        const backwardMaxSpeed = resolveMaxSpeed(feature.properties, highway, "backward");
+        const freeFlowFactor = this.freeFlowFactors[highway];
         const surface: string = feature.properties?.surface || "unknown";
         const onewayDir = parseOneway(feature.properties?.oneway);
         const isRoundabout = feature.properties?.junction === "roundabout";
         // Roundabouts are implicitly one-way forward regardless of the oneway tag
         const effectiveOneway = isRoundabout ? "forward" : onewayDir;
         // Apply speed reduction for roundabout segments
-        const effectiveMaxSpeed = isRoundabout ? maxSpeed * 0.5 : maxSpeed;
+        const roundaboutFactor = isRoundabout ? 0.5 : 1;
+        const forwardSpeed = forwardMaxSpeed * roundaboutFactor;
+        const backwardSpeed = backwardMaxSpeed * roundaboutFactor;
+
+        // A way-level traffic_calming tag (chicane/choker/bump run the length
+        // of the segment, unlike a point feature at a single node) caps the
+        // free-flow speed instead of adding a node delay — see `nodeControls`
+        // below for the point-feature case.
+        const wayCalming = feature.properties?.traffic_calming;
+        const calmingSpeedCap =
+          wayCalming && wayCalming !== "no" ? TRAFFIC_CALMING_MAX_SPEED_KMH : Infinity;
 
         // Skip access-restricted roads (private estates, gated communities)
         const accessTag = feature.properties?.access;
@@ -273,7 +337,8 @@ export class GraphBuilder {
               bearing,
               name: streetName,
               highway,
-              maxSpeed: effectiveMaxSpeed,
+              maxSpeed: forwardSpeed,
+              freeFlowSpeed: Math.min(forwardSpeed * freeFlowFactor, calmingSpeedCap),
               surface,
               oneway: effectiveOneway === "forward",
               lanes,
@@ -295,7 +360,8 @@ export class GraphBuilder {
               bearing: (bearing + 180) % 360,
               name: streetName,
               highway,
-              maxSpeed: effectiveMaxSpeed,
+              maxSpeed: backwardSpeed,
+              freeFlowSpeed: Math.min(backwardSpeed * freeFlowFactor, calmingSpeedCap),
               surface,
               oneway: effectiveOneway === "reverse",
               lanes,
@@ -309,51 +375,61 @@ export class GraphBuilder {
       }
     });
 
-    // Second pass: parse OSM turn restriction relations
+    // Second pass: collect OSM turn restriction relations (the network CLI
+    // emits them as Point features at the via node). They are resolved to
+    // edge-level bans in `buildTurnBans` once every edge exists.
     data.features.forEach((feature) => {
-      const props = feature.properties ?? {};
-      // Match relation features: osmium exports them as type=restriction features
-      if (props["type"] !== "restriction" && props["@type"] !== "restriction") return;
-
-      const fromWayId = String(props["from"] ?? props["from:way"] ?? "");
-      // Snap the via node ID to match the snapped coordinate format used in the graph
-      const rawVia = String(props["via"] ?? props["via:node"] ?? "");
-      const viaParts = rawVia.split(",");
-      const viaNodeId =
-        viaParts.length === 2 && !isNaN(Number(viaParts[0])) && !isNaN(Number(viaParts[1]))
-          ? this.makeNodeKey(Number(viaParts[0]), Number(viaParts[1]))
-          : rawVia;
-      const toWayId = String(props["to"] ?? props["to:way"] ?? "");
-      const restrictionValue = String(
-        props["restriction"] ?? props["restriction:motor_vehicle"] ?? ""
+      const parsed = parseTurnRestriction(feature.properties ?? {}, feature.geometry, (lat, lon) =>
+        this.makeNodeKey(lat, lon)
       );
-
-      if (!fromWayId || !viaNodeId || !toWayId || !restrictionValue) return;
-
-      const isProhibitory = restrictionValue.startsWith("no_");
-      const isMandatory = restrictionValue.startsWith("only_");
-      if (!isProhibitory && !isMandatory) return;
-
-      const key = `${fromWayId}|${viaNodeId}`;
-      const typeKey = `${key}|type`;
-
-      if (!this.turnRestrictions.has(key)) {
-        this.turnRestrictions.set(key, new Set());
-        this.turnRestrictionTypes.set(typeKey, isProhibitory ? "prohibitory" : "mandatory");
-      }
-      this.turnRestrictions.get(key)!.add(toWayId);
+      if (parsed) this.turnRestrictions.push(parsed);
     });
 
-    // Third pass: mark traffic signal nodes
+    // Third pass: mark traffic signal nodes and collect node controls (stop,
+    // give-way, crossings, level crossings, point traffic-calming). A node can
+    // pick up controls from more than one point feature (or a single feature
+    // with a compound `highway=a;b` value); `mergeNodeControl` keeps the
+    // highest-priority one per node.
     data.features.forEach((feature) => {
-      if (feature.geometry?.type === "Point") {
-        const props = feature.properties ?? {};
-        if (props.highway !== "traffic_signals") return;
-        const [lon, lat] = feature.geometry.coordinates as [number, number];
-        const nearest = this.findNearestNodeDuringBuild([lat, lon]);
-        if (nearest) nearest.trafficSignal = true;
+      if (feature.geometry?.type !== "Point") return;
+      const props = feature.properties ?? {};
+      const controls = parseNodeControls(props);
+      if (controls.length === 0) return;
+
+      const [lon, lat] = feature.geometry.coordinates as [number, number];
+      const nearest = this.findControlNode(lat, lon);
+      if (!nearest) return;
+
+      for (const control of controls) {
+        if (control.kind === "traffic_signals") nearest.trafficSignal = true;
+        this.nodeControls.set(
+          nearest.id,
+          mergeNodeControl(this.nodeControls.get(nearest.id), control)
+        );
       }
     });
+  }
+
+  /**
+   * Resolves a Point feature's coordinate to a graph node. Point features
+   * tagged on a node shared with a way (the common case for signals/stops/
+   * crossings/etc.) round-trip through osmium at IDENTICAL precision to that
+   * way vertex, so an exact snapped-key lookup resolves almost every one in
+   * O(1); only a genuinely unmatched coordinate falls back to the O(nodes)
+   * scan `findNearestNodeDuringBuild` uses. With ~28k control points on the
+   * Nairobi extract, that fallback path alone would be too slow to take for
+   * every point.
+   */
+  private findControlNode(lat: number, lon: number): Node | null {
+    const exact = this.nodes.get(this.makeNodeKey(lat, lon));
+    if (exact) return exact;
+    const nearest = this.findNearestNodeDuringBuild([lat, lon]);
+    if (!nearest) return null;
+    // Unbounded snapping would pin a control on a filtered-out road to
+    // whatever graph node happens to be closest, however far away.
+    return utils.calculateDistance([lat, lon], nearest.coordinates) <= MAX_CONTROL_SNAP_KM
+      ? nearest
+      : null;
   }
 
   /**
@@ -372,7 +448,67 @@ export class GraphBuilder {
         edge.id,
         edge.end.connections.filter((e) => e.end.id !== edge.start.id)
       );
+      // Precomputed node-control delay for arriving at `edge.end` via THIS
+      // edge (depends on the approach's own highway class, see cost.ts). Kept
+      // out of `edgeBaseCost` (incident/weather factors must not scale it) and
+      // added in the A* loop (see `applyDynamicCost`); `buildLandmarks` adds it
+      // to the landmark weights, which runs after this.
+      const delay = nodeDelayHours(this.nodeControls.get(edge.end.id), edge.highway);
+      if (delay > 0) edge.nodeDelayH = delay;
     }
+  }
+
+  /**
+   * Stamps each node's distinct-neighbour count (inbound or outbound) as
+   * `node.degree`, which the turn model uses to tell a dead end / bend /
+   * intersection apart. Two-way roads show up in `connections`; a one-way
+   * arrival with no edge back is counted from the arriving side.
+   */
+  private stampNodeDegrees(): void {
+    for (const node of this.nodes.values()) {
+      const seen: string[] = [];
+      for (const edge of node.connections) {
+        if (!seen.includes(edge.end.id)) seen.push(edge.end.id);
+      }
+      node.degree = seen.length;
+    }
+    for (const edge of this.edges.values()) {
+      const end = edge.end;
+      if (!end.connections.some((e) => e.end.id === edge.start.id)) {
+        end.degree = (end.degree ?? 0) + 1;
+      }
+    }
+  }
+
+  /**
+   * Resolves the collected restriction relations into `inEdgeId -> banned
+   * outEdgeIds` (see `resolveTurnBans`). The inbound-edge lookup is built only
+   * for via nodes, so a network without restrictions pays nothing.
+   */
+  private buildTurnBans(): void {
+    if (this.turnRestrictions.length === 0) return;
+    const viaIds = new Set(this.turnRestrictions.map((r) => r.via));
+    const toTurnEdge = (e: Edge) => ({
+      id: e.id,
+      streetId: e.streetId,
+      startNodeId: e.start.id,
+      endNodeId: e.end.id,
+    });
+    const incoming = new Map<string, ReturnType<typeof toTurnEdge>[]>();
+    for (const edge of this.edges.values()) {
+      if (!viaIds.has(edge.end.id)) continue;
+      let list = incoming.get(edge.end.id);
+      if (!list) {
+        list = [];
+        incoming.set(edge.end.id, list);
+      }
+      list.push(toTurnEdge(edge));
+    }
+    this.turnBans = resolveTurnBans(
+      this.turnRestrictions,
+      (id) => incoming.get(id) ?? [],
+      (id) => (this.nodes.get(id)?.connections ?? []).map(toTurnEdge)
+    );
   }
 
   /**

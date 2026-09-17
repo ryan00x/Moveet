@@ -46,6 +46,88 @@ describe("envSchema / parseEnv", () => {
     expect(cfg.SPEED_VARIATION).toBe(0.1);
   });
 
+  it("parses FREE_FLOW_FACTORS overrides over the per-class defaults", () => {
+    expect(parseEnv({}).FREE_FLOW_FACTORS.residential).toBeGreaterThan(0);
+    const cfg = parseEnv(validEnv({ FREE_FLOW_FACTORS: "residential=0.5" }));
+    expect(cfg.FREE_FLOW_FACTORS.residential).toBe(0.5);
+    expect(() => parseEnv(validEnv({ FREE_FLOW_FACTORS: "residential=2" }))).toThrow();
+  });
+
+  it("parses DRIVE_SIDE, defaulting to right-hand traffic", () => {
+    expect(parseEnv({}).DRIVE_SIDE).toBe("right");
+    expect(parseEnv(validEnv({ DRIVE_SIDE: "left" })).DRIVE_SIDE).toBe("left");
+    expect(() => parseEnv(validEnv({ DRIVE_SIDE: "middle" }))).toThrow();
+  });
+
+  it("parses speed profile settings, disabled by default", () => {
+    const d = parseEnv({});
+    expect(d.SPEED_PROFILES_ENABLED).toBe(false);
+    expect(d.SPEED_PROFILE_SOURCES).toEqual(["sim"]);
+    expect(d.SPEED_PROFILE_PERIOD).toBe("week");
+    expect(d.SPEED_PROFILE_BUCKET_HOURS).toBe(1);
+    expect(d.SPEED_PROFILE_MIN_SAMPLES).toBe(5);
+    expect(d.SPEED_PROFILE_EWMA_ALPHA).toBe(0.2);
+    expect(d.SPEED_PROFILE_MAX_SPEED_RATIO).toBe(1);
+    expect(d.SPEED_PROFILE_PUBLISH_INTERVAL_MS).toBe(30_000);
+    expect(d.SPEED_PROFILE_SEED_FILE).toBe("");
+
+    const c = parseEnv(
+      validEnv({
+        SPEED_PROFILES_ENABLED: "true",
+        SPEED_PROFILE_SOURCES: "sim, adapter",
+        SPEED_PROFILE_PERIOD: "day",
+        SPEED_PROFILE_BUCKET_HOURS: "6",
+        SPEED_PROFILE_MAX_SPEED_RATIO: "1.2",
+      })
+    );
+    expect(c.SPEED_PROFILES_ENABLED).toBe(true);
+    expect(c.SPEED_PROFILE_SOURCES).toEqual(["sim", "adapter"]);
+    expect(c.SPEED_PROFILE_BUCKET_HOURS).toBe(6);
+    expect(c.SPEED_PROFILE_MAX_SPEED_RATIO).toBe(1.2);
+  });
+
+  it("rejects invalid speed profile settings", () => {
+    expect(() => parseEnv(validEnv({ SPEED_PROFILE_SOURCES: "sim,radar" }))).toThrow();
+    expect(() => parseEnv(validEnv({ SPEED_PROFILE_SOURCES: "" }))).toThrow();
+    expect(() => parseEnv(validEnv({ SPEED_PROFILE_BUCKET_HOURS: "5" }))).toThrow();
+    expect(() =>
+      parseEnv(validEnv({ SPEED_PROFILE_PERIOD: "day", SPEED_PROFILE_BUCKET_HOURS: "48" }))
+    ).toThrow();
+    expect(() => parseEnv(validEnv({ SPEED_PROFILE_MAX_SPEED_RATIO: "0.9" }))).toThrow();
+    expect(() => parseEnv(validEnv({ SPEED_PROFILE_EWMA_ALPHA: "0" }))).toThrow();
+    expect(() => parseEnv(validEnv({ SPEED_PROFILE_MIN_SAMPLES: "0" }))).toThrow();
+  });
+
+  it("parses weather settings, disabled by default with no lat/lon override", () => {
+    const d = parseEnv({});
+    expect(d.WEATHER_ENABLED).toBe(false);
+    expect(d.WEATHER_POLL_INTERVAL_MS).toBe(600_000);
+    expect(d.WEATHER_FETCH_TIMEOUT_MS).toBe(5000);
+    expect(d.WEATHER_LAT).toBeUndefined();
+    expect(d.WEATHER_LON).toBeUndefined();
+
+    const c = parseEnv(
+      validEnv({
+        WEATHER_ENABLED: "true",
+        WEATHER_POLL_INTERVAL_MS: "120000",
+        WEATHER_FETCH_TIMEOUT_MS: "2000",
+        WEATHER_LAT: "-1.29",
+        WEATHER_LON: "36.82",
+      })
+    );
+    expect(c.WEATHER_ENABLED).toBe(true);
+    expect(c.WEATHER_POLL_INTERVAL_MS).toBe(120_000);
+    expect(c.WEATHER_FETCH_TIMEOUT_MS).toBe(2000);
+    expect(c.WEATHER_LAT).toBe(-1.29);
+    expect(c.WEATHER_LON).toBe(36.82);
+  });
+
+  it("rejects invalid weather settings", () => {
+    expect(() => parseEnv(validEnv({ WEATHER_POLL_INTERVAL_MS: "10" }))).toThrow(); // below 1000ms floor
+    expect(() => parseEnv(validEnv({ WEATHER_LAT: "500" }))).toThrow(); // out of [-90, 90]
+    expect(() => parseEnv(validEnv({ WEATHER_LON: "-500" }))).toThrow(); // out of [-180, 180]
+  });
+
   it("applies defaults when env vars are missing", () => {
     const cfg = parseEnv({});
     expect(cfg.PORT).toBe(5010);
