@@ -1,11 +1,18 @@
 import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import { IconLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { SimpleMeshLayer } from "@deck.gl/mesh-layers";
 import type { Fleet, VehicleType } from "@/types";
 import { vehicleStore } from "../../hooks/vehicleStore";
 import { VEHICLE_INTERPOLATION, shouldSnapPosition } from "../../data/constants";
 import { useRegisterLayers } from "../../components/Map/hooks/useDeckLayers";
 import { useMapContext } from "../../components/Map/hooks";
 import { VehicleIconAtlasManager, type VehicleAtlas } from "./vehicleIconAtlas";
+import {
+  VEHICLE_MESHES,
+  MESH_VEHICLE_TYPES,
+  MESH_REFERENCE_LENGTH_M,
+  meshTypeFor,
+} from "./vehicleMeshes";
 import { shouldAggregate } from "./densityView";
 import { resolveMapColor } from "../../lib/mapColor";
 
@@ -58,7 +65,7 @@ interface VehiclesLayerProps {
   selectable?: boolean;
 }
 
-/** Interpolated vehicle data for the deck.gl IconLayer. */
+/** Interpolated vehicle data for the deck.gl IconLayer / SimpleMeshLayer. */
 interface VehicleIconDatum {
   id: string;
   position: [number, number]; // [lng, lat]
@@ -66,16 +73,34 @@ interface VehicleIconDatum {
   angle: number;
   /** Atlas key for this vehicle's (type, color) sprite. */
   icon: string;
+  /** Mesh bucket this vehicle belongs to (an entry in `VEHICLE_MESHES`). */
+  meshType: string;
   isSelected: boolean;
   isHovered: boolean;
   /**
    * Icon tint [r,g,b,a] — dimmed alpha for near-idle vehicles, full for
-   * moving ones. Built once per vehicle per publish (like `position`/`icon`
-   * below) so the IconLayer's `getColor` accessor returns a stored
-   * reference instead of allocating a new array per call.
+   * moving ones. One of two shared module-level references, so the
+   * IconLayer's `getColor` accessor returns a stored reference rather than
+   * allocating, and the publish loop allocates nothing for it either.
    */
-  iconColor: [number, number, number, number];
+  iconColor: RGBA;
+  /**
+   * The vehicle's own colour as [r,g,b,a] for the mesh, which (unlike the
+   * pre-tinted sprite) carries no colour of its own. Always opaque; idle is
+   * signalled by dimming. Interned per (colour, idle) pair in `meshColorFor`,
+   * so this is a shared reference too.
+   */
+  meshColor: RGBA;
+  /**
+   * Mesh rotation as deck.gl's [pitch, yaw, roll] in degrees. Only yaw moves;
+   * it holds the same value as `angle`. Stored on the datum (not built in the
+   * accessor) so a 1000-vehicle frame does not allocate 1000 arrays per
+   * accessor pass.
+   */
+  orientation: [number, number, number];
 }
+
+type RGBA = [number, number, number, number];
 
 /** Per-vehicle interpolation state for smooth animation between WS updates. */
 interface VehicleInterp {
@@ -182,6 +207,159 @@ const IDLE_SPEED_KMH = 1;
 const IDLE_ICON_ALPHA = 166; // 0.65 * 255
 const MOVING_ICON_ALPHA = 255;
 
+/** The only two sprite tints there are — shared so the hot loop allocates none. */
+const IDLE_ICON_TINT: RGBA = [255, 255, 255, IDLE_ICON_ALPHA];
+const MOVING_ICON_TINT: RGBA = [255, 255, 255, MOVING_ICON_ALPHA];
+
+/**
+ * Zoom at (and above) which vehicles render as 3D meshes instead of sprites.
+ *
+ * This is a readability threshold, not a performance one: a model costs about
+ * 30 triangles against the sprite's 2, which is noise beside the road network
+ * already on screen. It sits one step above the density threshold, so the three
+ * representations tile the zoom range without a gap: hexagons below 13 (when
+ * the user opts in), sprites from 13 to 14, meshes from 14 up.
+ *
+ * It was 16 — the anchor of the sizing curve — which turned out to be too far
+ * in: vehicles only became 3D once you were almost on top of them, and the
+ * whole middle of the zoom range, where you actually watch the fleet move, was
+ * still flat. 14 is roughly where a simplified model is still wider than it is
+ * ambiguous, at about 11 screen pixels.
+ */
+export const MESH_ZOOM_THRESHOLD = 14;
+
+/** Web Mercator ground resolution at zoom 0, metres per pixel (256px tiles). */
+const METERS_PER_PIXEL_AT_Z0 = 156543.03392;
+
+/**
+ * Smallest a vehicle is allowed to get on screen, in pixels.
+ *
+ * Below this the models stop being shapes and start being specks, so the floor
+ * takes over from true scale. See `meshSizeScaleForZoom`.
+ */
+export const MIN_MESH_PX = 7;
+
+/**
+ * How much to scale the models by, given the camera.
+ *
+ * `SimpleMeshLayer` measures its geometry in metres on the ground and the
+ * models are authored at life size, so **1 is true scale** and that is what
+ * this returns wherever it can. An earlier pass instead scaled them to match
+ * the sprite's pixel footprint, which made a car about 57 metres long at zoom
+ * 16 — most of the width of a city block, and the reason the fleet looked
+ * enormous against the street grid.
+ *
+ * True scale alone does not work at every zoom: a 4.4m car is under two pixels
+ * at zoom 16 and invisible. So the return is clamped to a floor of
+ * `MIN_MESH_PX` on screen. The two regimes meet at about zoom 18.3, where a
+ * real car finally covers 7 pixels; from there in, the scale is honest, and
+ * further out vehicles hold at a legible minimum instead of vanishing.
+ *
+ * `latitude` matters because Web Mercator's metres-per-pixel is latitude
+ * dependent. It costs one cosine per publish.
+ */
+function meshSizeScaleForZoom(zoom: number, latitude: number): number {
+  const metersPerPixel =
+    (METERS_PER_PIXEL_AT_Z0 * Math.cos((latitude * Math.PI) / 180)) / 2 ** zoom;
+  const floor = (MIN_MESH_PX * metersPerPixel) / MESH_REFERENCE_LENGTH_M;
+  return Math.max(1, floor);
+}
+
+/**
+ * How far a near-idle vehicle's mesh colour is pulled towards black.
+ *
+ * Sprites signal idle by dropping alpha, which a mesh cannot borrow: a
+ * semi-transparent solid still writes depth, so its own far faces blend over
+ * its near ones in whatever order the index buffer happens to be in, and the
+ * vehicle turns inside out. Meshes stay fully opaque and dim instead.
+ */
+const IDLE_MESH_DIM = 0.74;
+
+/**
+ * The neutral paints a vehicle can be finished in.
+ *
+ * Real traffic is overwhelmingly white, silver and grey, and a street where
+ * every car is the same shade of one colour reads as a diagram rather than as
+ * traffic. Each vehicle picks one of these deterministically from its id, so a
+ * fleet varies without flickering: the same vehicle is the same colour on every
+ * frame, across reconnects, and in every session.
+ *
+ * All four are neutral by construction, so the fleet hue mixed in on top is
+ * still the only thing that carries meaning.
+ */
+export const MESH_PAINTS: ReadonlyArray<readonly [number, number, number]> = [
+  [236, 238, 241], // white
+  [196, 200, 206], // silver
+  [142, 148, 158], // grey
+  [92, 97, 106], // graphite
+];
+
+/**
+ * Pick a vehicle's paint from its id — an FNV-1a hash, folded to the palette.
+ *
+ * Computed inline on every publish rather than cached. It is a handful of
+ * character operations against ids that are a few characters long, which is
+ * cheaper than the bookkeeping a cache would need to avoid growing without
+ * bound as vehicles come and go.
+ */
+function paintForId(id: string): readonly [number, number, number] {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < id.length; i++) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return MESH_PAINTS[(hash >>> 0) % MESH_PAINTS.length];
+}
+
+/**
+ * How far towards the chosen paint the fleet colour is pulled.
+ *
+ * A vehicle rendered in a saturated fleet colour reads as a marker shaped like
+ * a car, not as a car. A lit 3D body also needs far less colour than a flat
+ * sprite does to stay distinguishable. What is left of the hue is enough to
+ * tell two fleets apart side by side, while the fleet colour stays at full
+ * strength everywhere it actually carries meaning: the sprites, the legend and
+ * the selection ring.
+ */
+const MESH_PAINT_MIX = 0.72;
+
+/**
+ * Intern the [r,g,b,a] tuple a mesh instance is coloured with.
+ *
+ * The sprite atlas bakes the vehicle colour into the texture, so the IconLayer
+ * only ever tints white. A mesh has no colour of its own, so the fleet colour
+ * has to arrive through `getColor`.
+ *
+ * `resolveMapColor` does the parsing, via a 1x1 canvas, because the colour
+ * arriving here is whatever `tokens.css` holds and those tokens are `oklch()`.
+ * The atlas's own `parseColor` only understands hex and `rgb()`: handed
+ * `oklch(0.62 0.15 250)` it pulls out the three numbers and reads them as RGB,
+ * yielding [1, 0, 250]. That turned every vehicle type into the same saturated
+ * blue, since the third oklch component is a hue angle.
+ *
+ * `resolveMapColor` is documented as too slow for a per-frame path, which is
+ * exactly why this map exists: the key space is (fleet colours x 2 idle
+ * states), so a miss happens once per colour and every datum afterwards holds
+ * a shared reference.
+ */
+const meshColorCache = new Map<string, RGBA>();
+function meshColorFor(
+  color: string,
+  idle: boolean,
+  paint: readonly [number, number, number]
+): RGBA {
+  const key = `${color}|${paint[0]}|${idle ? 1 : 0}`;
+  const cached = meshColorCache.get(key);
+  if (cached) return cached;
+  const [r, g, b] = resolveMapColor(color);
+  const dim = idle ? IDLE_MESH_DIM : 1;
+  const mix = (channel: number, neutral: number) =>
+    Math.round((neutral * MESH_PAINT_MIX + channel * (1 - MESH_PAINT_MIX)) * dim);
+  const value: RGBA = [mix(r, paint[0]), mix(g, paint[1]), mix(b, paint[2]), 255];
+  meshColorCache.set(key, value);
+  return value;
+}
+
 /**
  * Constant empty publish used while the density view has taken over. Reusing
  * one reference means React bails out of every re-render after the first
@@ -221,6 +399,11 @@ export default function VehiclesLayer({
   const { getZoom, getBoundingBox } = useMapContext();
   const [vehicleData, setVehicleData] = useState<VehicleIconDatum[]>([]);
   const [iconSize, setIconSize] = useState(BASE_SIZE_PX);
+  // Zoomed-in vehicles render as lit 3D meshes, zoomed-out ones as sprites.
+  // Both are driven by the same publish, so the swap costs a layer rebuild and
+  // nothing in the hot loop.
+  const [use3D, setUse3D] = useState(false);
+  const [meshSizeScale, setMeshSizeScale] = useState(1);
   const [atlasManager] = useState(() => new VehicleIconAtlasManager());
   // Warm the atlas with the default per-type sprites so the icon layer exists
   // (and renders instantly) before the first fleet-colored vehicle arrives.
@@ -536,21 +719,24 @@ export default function VehiclesLayer({
         const vehicleType = v.type || "car";
         // Precomputed lookups — no resolveCSSColor() call in the hot loop.
         const color = fleetColors.get(v.id) ?? defaultColorForType(vehicleType);
+        const idle = (v.speed ?? 0) < IDLE_SPEED_KMH;
+        // Heading is compass radians (0 = north, CW); both deck.gl's icon
+        // rotation and the mesh's yaw turn CCW, so the same negated value
+        // drives either representation.
+        const angle = (-heading * 180) / Math.PI;
 
         vehicles.push({
           id: v.id,
           position: [lng, lat], // deck.gl expects [lng, lat]
-          // Heading is compass radians (0 = north, CW); deck.gl rotates CCW.
-          angle: (-heading * 180) / Math.PI,
+          angle,
           icon: atlasManager.register(vehicleType, color),
+          meshType: meshTypeFor(vehicleType),
           isSelected: v.id === currentSelectedId,
           isHovered: v.id === currentHoveredId,
-          iconColor: [
-            255,
-            255,
-            255,
-            (v.speed ?? 0) < IDLE_SPEED_KMH ? IDLE_ICON_ALPHA : MOVING_ICON_ALPHA,
-          ],
+          iconColor: idle ? IDLE_ICON_TINT : MOVING_ICON_TINT,
+          meshColor: meshColorFor(color, idle, paintForId(v.id)),
+          // [pitch, yaw, roll]: vehicles stay level, so only yaw moves.
+          orientation: [0, angle, 0],
         });
       }
 
@@ -559,6 +745,10 @@ export default function VehiclesLayer({
         setAtlas(atlasManager.build());
       }
       setIconSize(iconSizeForZoom(currentZoom));
+      // Both are plain numbers/booleans, so React bails out of the re-render on
+      // every frame the camera didn't actually move.
+      setUse3D(currentZoom >= MESH_ZOOM_THRESHOLD);
+      setMeshSizeScale(meshSizeScaleForZoom(currentZoom, (south + north) / 2));
       setVehicleData(vehicles);
     };
 
@@ -666,6 +856,47 @@ export default function VehiclesLayer({
       },
     });
 
+    if (use3D) {
+      // One SimpleMeshLayer per vehicle type: a mesh layer draws a single
+      // geometry, so the five shapes cost five instanced draw calls rather than
+      // one. Bucketing is a single pass over the publish, and empty buckets are
+      // skipped so a fleet of nothing but cars still issues one call.
+      const buckets = new Map<string, VehicleIconDatum[]>();
+      for (const d of vehicleData) {
+        const bucket = buckets.get(d.meshType);
+        if (bucket) bucket.push(d);
+        else buckets.set(d.meshType, [d]);
+      }
+
+      const meshLayers = MESH_VEHICLE_TYPES.filter((type) => buckets.has(type)).map(
+        (type) =>
+          new SimpleMeshLayer<VehicleIconDatum>({
+            id: `vehicles-mesh-${type}`,
+            data: buckets.get(type),
+            mesh: VEHICLE_MESHES[type],
+            getPosition: (d) => d.position,
+            // Stored references, built once per vehicle per publish — see the
+            // RAF loop above. Nothing is allocated inside these accessors.
+            getOrientation: (d) => d.orientation,
+            getColor: (d) => d.meshColor,
+            sizeScale: meshSizeScale,
+            // Matte: vehicles should read by silhouette and shading, not by a
+            // specular highlight sliding across them as the camera turns.
+            material: {
+              ambient: 0.6,
+              diffuse: 0.78,
+              shininess: 24,
+              specularColor: [38, 40, 48],
+            },
+            pickable: true,
+            onClick: handleClick,
+            onHover: handleHover,
+          })
+      );
+
+      return [haloLayer, ringLayer, ...meshLayers];
+    }
+
     const vehiclesLayer = new IconLayer<VehicleIconDatum>({
       id: "vehicles",
       data: vehicleData,
@@ -704,6 +935,8 @@ export default function VehiclesLayer({
     handleHover,
     selectedId,
     hoveredId,
+    use3D,
+    meshSizeScale,
   ]);
 
   // Register layers with the DeckGLMap parent
