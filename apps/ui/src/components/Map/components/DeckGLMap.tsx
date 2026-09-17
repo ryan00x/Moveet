@@ -257,7 +257,7 @@ export const DeckGLMap: React.FC<DeckGLMapProps> = ({
     cullInputs.zoom
   );
   const allLayers = useMemo(
-    () => [...roadLayers, ...registeredLayers],
+    () => [...registeredLayers.under, ...roadLayers, ...registeredLayers.over],
     [roadLayers, registeredLayers]
   );
 
