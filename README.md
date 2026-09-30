@@ -141,4 +141,4 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. Security policy is 
 
 ## License
 
-[MIT](LICENSE) © Ivan Novazzi
+[MIT](LICENSE) © Ryan Kohler
