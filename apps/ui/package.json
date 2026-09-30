@@ -37,7 +37,7 @@
     "@luma.gl/webgl": "^9.3.6",
     "@moveet/shared-types": "*",
     "@tailwindcss/vite": "^4.3.3",
-    "@testing-library/dom": "^10.4.1",
+    "@testing-library/dom": "^10.4.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
